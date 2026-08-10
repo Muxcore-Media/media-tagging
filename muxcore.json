@@ -1,8 +1,16 @@
 {
   "id": "media-tagging",
   "name": "Content Tagging",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Content tagging and rule-based classification scaffold",
-  "roles": ["media", "tagging"],
-  "capabilities": ["media.tagging", "tagging", "classification", "settings"]
+  "roles": [
+    "media",
+    "tagging"
+  ],
+  "capabilities": [
+    "media.tagging",
+    "tagging",
+    "classification",
+    "settings"
+  ]
 }
