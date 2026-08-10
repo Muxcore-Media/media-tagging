@@ -35,16 +35,19 @@ func NewModule(cfg Config) *Module {
 		cfg.ID = "media-tagging"
 	}
 	if cfg.GRPCAddr == "" {
-		cfg.GRPCAddr = ":9700"
+		cfg.GRPCAddr = ":9740"
 	}
 	if cfg.HTTPAddr == "" {
-		cfg.HTTPAddr = ":9701"
+		cfg.HTTPAddr = ":9741"
 	}
 	if cfg.DefaultCategory == "" {
 		cfg.DefaultCategory = "general"
 	}
 	if v := os.Getenv("TAGGING_DEFAULT_CATEGORY"); v != "" {
 		cfg.DefaultCategory = v
+	}
+	if v := os.Getenv("TAGGING_GRPC_ADDR"); v != "" {
+		cfg.GRPCAddr = v
 	}
 	if v := os.Getenv("MUXCORE_HTTP_ADDR"); v != "" {
 		cfg.HTTPAddr = v

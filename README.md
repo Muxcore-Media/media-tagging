@@ -8,8 +8,8 @@ Exposes `muxcore.tagging.v1.TaggingService` with an in-memory store in **v0.1.0*
 
 | Service | Default |
 |---------|---------|
-| gRPC | `:9700` |
-| Health | `:9701` |
+| gRPC | `:9740` |
+| Health | `:9741` |
 
 ## Build / test
 
