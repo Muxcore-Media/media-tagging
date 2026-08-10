@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package muxcore.tagging.v1;
+
+option go_package = "github.com/Muxcore-Media/media-tagging/proto/gen/muxcore/tagging/v1;taggingv1";
+
+// TaggingService manages content tags and rule-based classification.
+service TaggingService {
+  rpc CreateTag(CreateTagRequest) returns (CreateTagResponse);
+  rpc ListTags(ListTagsRequest) returns (ListTagsResponse);
+  rpc DeleteTag(DeleteTagRequest) returns (DeleteTagResponse);
+  rpc SetItemTags(SetItemTagsRequest) returns (SetItemTagsResponse);
+  rpc GetItemTags(GetItemTagsRequest) returns (GetItemTagsResponse);
+  rpc UpsertRule(UpsertRuleRequest) returns (UpsertRuleResponse);
+  rpc ListRules(ListRulesRequest) returns (ListRulesResponse);
+  rpc DeleteRule(DeleteRuleRequest) returns (DeleteRuleResponse);
+  rpc Classify(ClassifyRequest) returns (ClassifyResponse);
+}
+
+message Tag {
+  string id = 1;
+  string name = 2;
+  string category = 3;
+  string color = 4;
+}
+
+message ClassificationRule {
+  string id = 1;
+  string tag_id = 2;
+  // field: title | genre | path | media_type
+  string field = 3;
+  // match: contains | equals | prefix | regex
+  string match = 4;
+  string pattern = 5;
+  bool enabled = 6;
+}
+
+message CreateTagRequest {
+  string name = 1;
+  string category = 2;
+  string color = 3;
+}
+message CreateTagResponse { Tag tag = 1; }
+message ListTagsRequest { string category = 1; }
+message ListTagsResponse { repeated Tag tags = 1; }
+message DeleteTagRequest { string id = 1; }
+message DeleteTagResponse { bool success = 1; }
+
+message SetItemTagsRequest {
+  string media_id = 1;
+  repeated string tag_ids = 2;
+}
+message SetItemTagsResponse { repeated string tag_ids = 1; }
+message GetItemTagsRequest { string media_id = 1; }
+message GetItemTagsResponse {
+  string media_id = 1;
+  repeated Tag tags = 2;
+}
+
+message UpsertRuleRequest {
+  string id = 1;
+  string tag_id = 2;
+  string field = 3;
+  string match = 4;
+  string pattern = 5;
+  bool enabled = 6;
+}
+message UpsertRuleResponse { ClassificationRule rule = 1; }
+message ListRulesRequest {}
+message ListRulesResponse { repeated ClassificationRule rules = 1; }
+message DeleteRuleRequest { string id = 1; }
+message DeleteRuleResponse { bool success = 1; }
+
+message ClassifyRequest {
+  string media_id = 1;
+  string title = 2;
+  repeated string genres = 3;
+  string path = 4;
+  string media_type = 5;
+  bool merge = 6; // merge with existing tags (default replace when false)
+}
+message ClassifyResponse {
+  string media_id = 1;
+  repeated Tag tags = 2;
+  repeated string matched_rule_ids = 3;
+}
