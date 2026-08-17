@@ -1,0 +1,13 @@
+{
+  "type": "media.file.imported",
+  "payload": {
+    "media_type": "movie",
+    "title": "Spirited Away",
+    "year": 2001,
+    "tmdb_id": 129,
+    "original_path": "/downloads/Spirited.Away.2001.mkv",
+    "destination_path": "/library/anime/Spirited Away (2001).mkv",
+    "storage_key": "/library/anime/Spirited Away (2001).mkv",
+    "quality": "Bluray-1080p"
+  }
+}

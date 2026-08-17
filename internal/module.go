@@ -7,27 +7,34 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"google.golang.org/grpc"
 
 	"github.com/Muxcore-Media/core/pkg/contracts"
-	modulesdk "github.com/Muxcore-Media/core/sdk/go/module"
+	"github.com/Muxcore-Media/core/sdk/go/client"
 	taggingv1 "github.com/Muxcore-Media/media-tagging/proto/gen/muxcore/tagging/v1"
 )
 
 type Module struct {
 	id, grpcAddr, httpAddr string
+	dataDir                string
 	defaultCategory        string
+	eventsEnabled          bool
 	cfgMu                  sync.RWMutex
 	store                  *Store
 	grpcSrv                *grpc.Server
 	lis                    net.Listener
 	httpSrv                *http.Server
+
+	peerMu sync.RWMutex
+	mc     *client.Client
 }
 
 type Config struct {
-	ID, DefaultCategory, GRPCAddr, HTTPAddr string
+	ID, DefaultCategory, DataDir, GRPCAddr, HTTPAddr string
+	EventsEnabled                                    *bool
 }
 
 func NewModule(cfg Config) *Module {
@@ -43,8 +50,18 @@ func NewModule(cfg Config) *Module {
 	if cfg.DefaultCategory == "" {
 		cfg.DefaultCategory = "general"
 	}
+	if cfg.DataDir == "" {
+		cfg.DataDir = "./data"
+	}
+	eventsEnabled := true
+	if cfg.EventsEnabled != nil {
+		eventsEnabled = *cfg.EventsEnabled
+	}
 	if v := os.Getenv("TAGGING_DEFAULT_CATEGORY"); v != "" {
 		cfg.DefaultCategory = v
+	}
+	if v := os.Getenv("TAGGING_DATA_DIR"); v != "" {
+		cfg.DataDir = v
 	}
 	if v := os.Getenv("TAGGING_GRPC_ADDR"); v != "" {
 		cfg.GRPCAddr = v
@@ -52,33 +69,53 @@ func NewModule(cfg Config) *Module {
 	if v := os.Getenv("MUXCORE_HTTP_ADDR"); v != "" {
 		cfg.HTTPAddr = v
 	}
+	if v := os.Getenv("TAGGING_EVENTS_ENABLED"); v != "" {
+		eventsEnabled = v == "1" || v == "true" || v == "TRUE"
+	}
 	return &Module{
 		id: cfg.ID, grpcAddr: cfg.GRPCAddr, httpAddr: cfg.HTTPAddr,
-		defaultCategory: cfg.DefaultCategory, store: NewStore(),
+		dataDir: cfg.DataDir, defaultCategory: cfg.DefaultCategory,
+		eventsEnabled: eventsEnabled,
 	}
 }
 
 func (m *Module) Info() contracts.ModuleInfo {
 	return contracts.ModuleInfo{
-		ID: m.id, Name: "Content Tagging", Version: "0.1.0",
+		ID: m.id, Name: "Content Tagging", Version: "0.2.0",
 		Roles:        []string{"media", "tagging"},
-		Description:  "Content tagging and rule-based classification (scaffold)",
+		Description:  "Content tagging and rule-based classification with SQLite persistence",
 		Capabilities: []string{"media.tagging", "tagging", "classification", "settings"},
 		HTTPAddr:     m.grpcAddr,
 	}
 }
 
-func (m *Module) Init(ctx context.Context) error { return nil }
+func (m *Module) Init(ctx context.Context) error {
+	if err := os.MkdirAll(m.dataDir, 0o700); err != nil {
+		return fmt.Errorf("create data dir: %w", err)
+	}
+	dbPath := filepath.Join(m.dataDir, "tagging.db")
+	store, err := OpenStore(dbPath)
+	if err != nil {
+		return err
+	}
+	m.store = store
+	slog.Info("tagging store open", "db", dbPath)
+	return nil
+}
 
 func (m *Module) Start(ctx context.Context) error {
+	if m.store == nil {
+		return fmt.Errorf("store not initialized")
+	}
 	lis, err := net.Listen("tcp", m.grpcAddr)
 	if err != nil {
 		return fmt.Errorf("listen gRPC %s: %w", m.grpcAddr, err)
 	}
 	m.lis = lis
+	m.grpcAddr = lis.Addr().String()
 	m.grpcSrv = grpc.NewServer()
 	taggingv1.RegisterTaggingServiceServer(m.grpcSrv, &tagServer{m: m})
-	modulesdk.RegisterSettings(m.grpcSrv, m.id, m)
+	registerTaggingMesh(m.grpcSrv, m.id, m)
 	go func() {
 		slog.Info("tagging gRPC listening", "addr", m.grpcAddr)
 		if err := m.grpcSrv.Serve(lis); err != nil {
@@ -90,15 +127,28 @@ func (m *Module) Start(ctx context.Context) error {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	m.httpSrv = &http.Server{Addr: m.httpAddr, Handler: mux}
+	m.registerTaggingHTTPAPI(mux)
+	httpLis, err := net.Listen("tcp", m.httpAddr)
+	if err != nil {
+		return fmt.Errorf("listen HTTP %s: %w", m.httpAddr, err)
+	}
+	m.httpAddr = httpLis.Addr().String()
+	m.httpSrv = &http.Server{Handler: mux}
 	go func() {
 		slog.Info("health listening", "addr", m.httpAddr)
-		if err := m.httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := m.httpSrv.Serve(httpLis); err != nil && err != http.ErrServerClosed {
 			slog.Error("health serve", "error", err)
 		}
 	}()
+	m.startEventSubscribe()
 	return nil
 }
+
+// GRPCListenAddr returns the bound gRPC address after Start.
+func (m *Module) GRPCListenAddr() string { return m.grpcAddr }
+
+// HTTPListenAddr returns the bound health/HTTP API address after Start.
+func (m *Module) HTTPListenAddr() string { return m.httpAddr }
 
 func (m *Module) Stop(ctx context.Context) error {
 	if m.grpcSrv != nil {
@@ -107,10 +157,19 @@ func (m *Module) Stop(ctx context.Context) error {
 	if m.httpSrv != nil {
 		_ = m.httpSrv.Shutdown(ctx)
 	}
+	if m.store != nil {
+		_ = m.store.Close()
+		m.store = nil
+	}
 	return nil
 }
 
-func (m *Module) Health(ctx context.Context) error { return nil }
+func (m *Module) Health(ctx context.Context) error {
+	if m.store == nil {
+		return fmt.Errorf("store not open")
+	}
+	return nil
+}
 
 type tagServer struct {
 	taggingv1.UnimplementedTaggingServiceServer
@@ -132,7 +191,10 @@ func (s *tagServer) CreateTag(_ context.Context, req *taggingv1.CreateTagRequest
 }
 
 func (s *tagServer) ListTags(_ context.Context, req *taggingv1.ListTagsRequest) (*taggingv1.ListTagsResponse, error) {
-	items := s.m.store.ListTags(req.GetCategory())
+	items, err := s.m.store.ListTags(req.GetCategory())
+	if err != nil {
+		return nil, err
+	}
 	out := make([]*taggingv1.Tag, 0, len(items))
 	for _, t := range items {
 		out = append(out, toPBTag(t))
@@ -156,7 +218,10 @@ func (s *tagServer) SetItemTags(_ context.Context, req *taggingv1.SetItemTagsReq
 }
 
 func (s *tagServer) GetItemTags(_ context.Context, req *taggingv1.GetItemTagsRequest) (*taggingv1.GetItemTagsResponse, error) {
-	items := s.m.store.GetItemTags(req.GetMediaId())
+	items, err := s.m.store.GetItemTags(req.GetMediaId())
+	if err != nil {
+		return nil, err
+	}
 	out := make([]*taggingv1.Tag, 0, len(items))
 	for _, t := range items {
 		out = append(out, toPBTag(t))
@@ -176,7 +241,10 @@ func (s *tagServer) UpsertRule(_ context.Context, req *taggingv1.UpsertRuleReque
 }
 
 func (s *tagServer) ListRules(_ context.Context, _ *taggingv1.ListRulesRequest) (*taggingv1.ListRulesResponse, error) {
-	items := s.m.store.ListRules()
+	items, err := s.m.store.ListRules()
+	if err != nil {
+		return nil, err
+	}
 	out := make([]*taggingv1.ClassificationRule, 0, len(items))
 	for _, r := range items {
 		out = append(out, toPBRule(r))

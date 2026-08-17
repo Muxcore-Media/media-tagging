@@ -1,12 +1,15 @@
 package internal
 
 import (
+	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
 
 	"github.com/google/uuid"
+	_ "modernc.org/sqlite"
 )
 
 type Tag struct {
@@ -25,67 +28,134 @@ type Rule struct {
 	Enabled bool
 }
 
+// Store persists tags, rules, and item tag assignments in SQLite.
 type Store struct {
-	mu       sync.RWMutex
-	tags     map[string]*Tag
-	rules    map[string]*Rule
-	itemTags map[string]map[string]struct{} // media_id -> tag_id set
+	db *sql.DB
 }
 
-func NewStore() *Store {
-	return &Store{
-		tags:     map[string]*Tag{},
-		rules:    map[string]*Rule{},
-		itemTags: map[string]map[string]struct{}{},
+// OpenStore opens or creates the SQLite database at path (WAL mode).
+func OpenStore(path string) (*Store, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("create db directory: %w", err)
 	}
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("enable WAL: %w", err)
+	}
+	if _, err := db.Exec(`PRAGMA foreign_keys=ON`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("enable foreign_keys: %w", err)
+	}
+	s := &Store{db: db}
+	if err := s.migrate(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *Store) migrate() error {
+	_, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS tags (
+			id       TEXT PRIMARY KEY,
+			name     TEXT NOT NULL,
+			category TEXT NOT NULL DEFAULT '',
+			color    TEXT NOT NULL DEFAULT ''
+		);
+		CREATE TABLE IF NOT EXISTS rules (
+			id         TEXT PRIMARY KEY,
+			tag_id     TEXT NOT NULL,
+			field      TEXT NOT NULL DEFAULT 'title',
+			match_mode TEXT NOT NULL DEFAULT 'contains',
+			pattern    TEXT NOT NULL,
+			enabled    INTEGER NOT NULL DEFAULT 1,
+			FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+		);
+		CREATE TABLE IF NOT EXISTS item_tags (
+			media_id TEXT NOT NULL,
+			tag_id   TEXT NOT NULL,
+			PRIMARY KEY (media_id, tag_id),
+			FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+		);
+		CREATE INDEX IF NOT EXISTS idx_tags_category ON tags(category);
+		CREATE INDEX IF NOT EXISTS idx_rules_tag ON rules(tag_id);
+		CREATE INDEX IF NOT EXISTS idx_item_tags_media ON item_tags(media_id);
+	`)
+	if err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	return nil
+}
+
+// Close closes the database.
+func (s *Store) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
 }
 
 func (s *Store) CreateTag(t Tag) (*Tag, error) {
 	if strings.TrimSpace(t.Name) == "" {
 		return nil, fmt.Errorf("tag name required")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if t.ID == "" {
 		t.ID = "tag_" + uuid.NewString()[:8]
 	}
-	cp := t
-	s.tags[cp.ID] = &cp
-	out := cp
+	_, err := s.db.Exec(
+		`INSERT INTO tags (id, name, category, color) VALUES (?, ?, ?, ?)`,
+		t.ID, t.Name, t.Category, t.Color,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("insert tag: %w", err)
+	}
+	out := t
 	return &out, nil
 }
 
-func (s *Store) ListTags(category string) []*Tag {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]*Tag, 0, len(s.tags))
-	for _, t := range s.tags {
-		if category != "" && !strings.EqualFold(t.Category, category) {
-			continue
+func (s *Store) ListTags(category string) ([]*Tag, error) {
+	var rows *sql.Rows
+	var err error
+	if category != "" {
+		rows, err = s.db.Query(
+			`SELECT id, name, category, color FROM tags WHERE lower(category) = lower(?) ORDER BY name`,
+			category,
+		)
+	} else {
+		rows, err = s.db.Query(`SELECT id, name, category, color FROM tags ORDER BY name`)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]*Tag, 0)
+	for rows.Next() {
+		var t Tag
+		if err := rows.Scan(&t.ID, &t.Name, &t.Category, &t.Color); err != nil {
+			return nil, err
 		}
-		cp := *t
+		cp := t
 		out = append(out, &cp)
 	}
-	return out
+	return out, rows.Err()
 }
 
 func (s *Store) DeleteTag(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.tags[id]; !ok {
+	res, err := s.db.Exec(`DELETE FROM tags WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
 		return fmt.Errorf("tag %q not found", id)
-	}
-	delete(s.tags, id)
-	for mid, set := range s.itemTags {
-		delete(set, id)
-		if len(set) == 0 {
-			delete(s.itemTags, mid)
-		}
-	}
-	for rid, r := range s.rules {
-		if r.TagID == id {
-			delete(s.rules, rid)
-		}
 	}
 	return nil
 }
@@ -94,45 +164,76 @@ func (s *Store) SetItemTags(mediaID string, tagIDs []string) ([]string, error) {
 	if strings.TrimSpace(mediaID) == "" {
 		return nil, fmt.Errorf("media_id required")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	set := map[string]struct{}{}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	seen := map[string]struct{}{}
+	unique := make([]string, 0, len(tagIDs))
 	for _, id := range tagIDs {
-		if _, ok := s.tags[id]; !ok {
-			return nil, fmt.Errorf("tag %q not found", id)
+		if _, ok := seen[id]; ok {
+			continue
 		}
-		set[id] = struct{}{}
+		var exists int
+		if err := tx.QueryRow(`SELECT 1 FROM tags WHERE id = ?`, id).Scan(&exists); err != nil {
+			if err == sql.ErrNoRows {
+				return nil, fmt.Errorf("tag %q not found", id)
+			}
+			return nil, err
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
 	}
-	s.itemTags[mediaID] = set
-	out := make([]string, 0, len(set))
-	for id := range set {
-		out = append(out, id)
+
+	if _, err := tx.Exec(`DELETE FROM item_tags WHERE media_id = ?`, mediaID); err != nil {
+		return nil, err
 	}
-	return out, nil
+	for _, id := range unique {
+		if _, err := tx.Exec(`INSERT INTO item_tags (media_id, tag_id) VALUES (?, ?)`, mediaID, id); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return unique, nil
 }
 
-func (s *Store) GetItemTags(mediaID string) []*Tag {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	set := s.itemTags[mediaID]
-	out := make([]*Tag, 0, len(set))
-	for id := range set {
-		if t, ok := s.tags[id]; ok {
-			cp := *t
-			out = append(out, &cp)
-		}
+func (s *Store) GetItemTags(mediaID string) ([]*Tag, error) {
+	rows, err := s.db.Query(`
+		SELECT t.id, t.name, t.category, t.color
+		FROM item_tags it
+		JOIN tags t ON t.id = it.tag_id
+		WHERE it.media_id = ?
+		ORDER BY t.name`, mediaID)
+	if err != nil {
+		return nil, err
 	}
-	return out
+	defer rows.Close()
+	out := make([]*Tag, 0)
+	for rows.Next() {
+		var t Tag
+		if err := rows.Scan(&t.ID, &t.Name, &t.Category, &t.Color); err != nil {
+			return nil, err
+		}
+		cp := t
+		out = append(out, &cp)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) UpsertRule(r Rule) (*Rule, error) {
 	if strings.TrimSpace(r.TagID) == "" || strings.TrimSpace(r.Pattern) == "" {
 		return nil, fmt.Errorf("tag_id and pattern required")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.tags[r.TagID]; !ok {
-		return nil, fmt.Errorf("tag %q not found", r.TagID)
+	var exists int
+	if err := s.db.QueryRow(`SELECT 1 FROM tags WHERE id = ?`, r.TagID).Scan(&exists); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("tag %q not found", r.TagID)
+		}
+		return nil, err
 	}
 	if r.ID == "" {
 		r.ID = "rule_" + uuid.NewString()[:8]
@@ -143,30 +244,61 @@ func (s *Store) UpsertRule(r Rule) (*Rule, error) {
 	if r.Match == "" {
 		r.Match = "contains"
 	}
-	cp := r
-	s.rules[cp.ID] = &cp
-	out := cp
+	enabled := 0
+	if r.Enabled {
+		enabled = 1
+	}
+	_, err := s.db.Exec(`
+		INSERT INTO rules (id, tag_id, field, match_mode, pattern, enabled)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			tag_id = excluded.tag_id,
+			field = excluded.field,
+			match_mode = excluded.match_mode,
+			pattern = excluded.pattern,
+			enabled = excluded.enabled`,
+		r.ID, r.TagID, r.Field, r.Match, r.Pattern, enabled,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("upsert rule: %w", err)
+	}
+	out := r
 	return &out, nil
 }
 
-func (s *Store) ListRules() []*Rule {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]*Rule, 0, len(s.rules))
-	for _, r := range s.rules {
-		cp := *r
+func (s *Store) ListRules() ([]*Rule, error) {
+	rows, err := s.db.Query(`
+		SELECT id, tag_id, field, match_mode, pattern, enabled FROM rules ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]*Rule, 0)
+	for rows.Next() {
+		var r Rule
+		var enabled int
+		if err := rows.Scan(&r.ID, &r.TagID, &r.Field, &r.Match, &r.Pattern, &enabled); err != nil {
+			return nil, err
+		}
+		r.Enabled = enabled != 0
+		cp := r
 		out = append(out, &cp)
 	}
-	return out
+	return out, rows.Err()
 }
 
 func (s *Store) DeleteRule(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.rules[id]; !ok {
+	res, err := s.db.Exec(`DELETE FROM rules WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
 		return fmt.Errorf("rule %q not found", id)
 	}
-	delete(s.rules, id)
 	return nil
 }
 
@@ -183,17 +315,39 @@ func (s *Store) Classify(in ClassifyInput) (tags []*Tag, matched []string, err e
 	if strings.TrimSpace(in.MediaID) == "" {
 		return nil, nil, fmt.Errorf("media_id required")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
 
 	hit := map[string]struct{}{}
 	if in.Merge {
-		for id := range s.itemTags[in.MediaID] {
+		rows, err := tx.Query(`SELECT tag_id FROM item_tags WHERE media_id = ?`, in.MediaID)
+		if err != nil {
+			return nil, nil, err
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, nil, err
+			}
 			hit[id] = struct{}{}
 		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	rules, err := listRulesTx(tx)
+	if err != nil {
+		return nil, nil, err
 	}
 	matched = make([]string, 0)
-	for _, r := range s.rules {
+	for _, r := range rules {
 		if !r.Enabled {
 			continue
 		}
@@ -203,15 +357,59 @@ func (s *Store) Classify(in ClassifyInput) (tags []*Tag, matched []string, err e
 		hit[r.TagID] = struct{}{}
 		matched = append(matched, r.ID)
 	}
-	s.itemTags[in.MediaID] = hit
-	tags = make([]*Tag, 0, len(hit))
+
+	if _, err := tx.Exec(`DELETE FROM item_tags WHERE media_id = ?`, in.MediaID); err != nil {
+		return nil, nil, err
+	}
 	for id := range hit {
-		if t, ok := s.tags[id]; ok {
-			cp := *t
-			tags = append(tags, &cp)
+		if _, err := tx.Exec(`INSERT INTO item_tags (media_id, tag_id) VALUES (?, ?)`, in.MediaID, id); err != nil {
+			return nil, nil, err
 		}
 	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+
+	tags = make([]*Tag, 0, len(hit))
+	for id := range hit {
+		t, err := s.getTag(id)
+		if err != nil {
+			continue
+		}
+		tags = append(tags, t)
+	}
 	return tags, matched, nil
+}
+
+func listRulesTx(tx *sql.Tx) ([]*Rule, error) {
+	rows, err := tx.Query(`SELECT id, tag_id, field, match_mode, pattern, enabled FROM rules`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]*Rule, 0)
+	for rows.Next() {
+		var r Rule
+		var enabled int
+		if err := rows.Scan(&r.ID, &r.TagID, &r.Field, &r.Match, &r.Pattern, &enabled); err != nil {
+			return nil, err
+		}
+		r.Enabled = enabled != 0
+		cp := r
+		out = append(out, &cp)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) getTag(id string) (*Tag, error) {
+	var t Tag
+	err := s.db.QueryRow(
+		`SELECT id, name, category, color FROM tags WHERE id = ?`, id,
+	).Scan(&t.ID, &t.Name, &t.Category, &t.Color)
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
 }
 
 func ruleMatches(r *Rule, in ClassifyInput) bool {

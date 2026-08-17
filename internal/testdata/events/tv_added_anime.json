@@ -1,0 +1,8 @@
+{
+  "type": "media.tv.added",
+  "payload": {
+    "name": "Cowboy Bebop",
+    "series_id": "tv_bebop",
+    "tmdb_id": 30983
+  }
+}
