@@ -1,0 +1,9 @@
+{
+  "type": "media.movie.added",
+  "payload": {
+    "title": "The Thing",
+    "movie_id": "mv_thing",
+    "tmdb_id": 1091,
+    "year": 1982
+  }
+}
