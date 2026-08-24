@@ -16,9 +16,12 @@ func (m *Module) Settings() []contracts.SettingDef {
 			Description: "Category applied when CreateTag omits category", Group: "Tagging",
 		},
 		{
-			Key: "data_dir", Label: "Data directory", Type: contracts.SettingTypeString,
-			Value: m.dataDir,
-			Description: "Directory for SQLite database (tagging.db)", Group: "Tagging",
+			Key:         "data_dir",
+			Label:       "Data directory",
+			Type:        contracts.SettingTypeString,
+			Value:       m.dataDir,
+			Description: "Directory for SQLite database (tagging.db)",
+			Group:       "Tagging",
 		},
 		{
 			Key: "events_enabled", Label: "Auto-tag on library events", Type: contracts.SettingTypeBool,
