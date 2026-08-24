@@ -20,7 +20,7 @@ func (m *Module) handleListTagsHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"store not open"}`, http.StatusServiceUnavailable)
 		return
 	}
-	items, err := m.store.ListTags(r.URL.Query().Get("category"))
+	items, err := m.store.ListTags(r.Context(), r.URL.Query().Get("category"))
 	if err != nil {
 		http.Error(w, fmtJSONError(err), http.StatusInternalServerError)
 		return
@@ -47,7 +47,7 @@ func (m *Module) handleCreateTagHTTP(w http.ResponseWriter, r *http.Request) {
 		Category string `json:"category"`
 		Color    string `json:"color"`
 	}
-	if err := json.Unmarshal(body, &req); err != nil {
+	if unmarshalErr := json.Unmarshal(body, &req); unmarshalErr != nil {
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
 		return
 	}
@@ -61,7 +61,7 @@ func (m *Module) handleCreateTagHTTP(w http.ResponseWriter, r *http.Request) {
 		cat = m.defaultCategory
 		m.cfgMu.RUnlock()
 	}
-	t, err := m.store.CreateTag(Tag{Name: req.Name, Category: cat, Color: req.Color})
+	t, err := m.store.CreateTag(r.Context(), Tag{Name: req.Name, Category: cat, Color: req.Color})
 	if err != nil {
 		http.Error(w, fmtJSONError(err), http.StatusInternalServerError)
 		return
@@ -74,7 +74,7 @@ func (m *Module) handleListRulesHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"store not open"}`, http.StatusServiceUnavailable)
 		return
 	}
-	items, err := m.store.ListRules()
+	items, err := m.store.ListRules(r.Context())
 	if err != nil {
 		http.Error(w, fmtJSONError(err), http.StatusInternalServerError)
 		return
@@ -96,7 +96,7 @@ func (m *Module) handleUpsertRuleHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"read body"}`, http.StatusBadRequest)
 		return
 	}
-	var req struct {
+	var req struct { //nolint:govet // fieldalignment: JSON field order for API requests
 		ID      string `json:"id"`
 		TagID   string `json:"tag_id"`
 		Field   string `json:"field"`
@@ -104,7 +104,7 @@ func (m *Module) handleUpsertRuleHTTP(w http.ResponseWriter, r *http.Request) {
 		Pattern string `json:"pattern"`
 		Enabled *bool  `json:"enabled"`
 	}
-	if err := json.Unmarshal(body, &req); err != nil {
+	if unmarshalErr := json.Unmarshal(body, &req); unmarshalErr != nil {
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
 		return
 	}
@@ -124,7 +124,7 @@ func (m *Module) handleUpsertRuleHTTP(w http.ResponseWriter, r *http.Request) {
 	if match == "" {
 		match = "contains"
 	}
-	rule, err := m.store.UpsertRule(Rule{
+	rule, err := m.store.UpsertRule(r.Context(), Rule{
 		ID: req.ID, TagID: req.TagID, Field: field,
 		Match: match, Pattern: req.Pattern, Enabled: enabled,
 	})
@@ -145,7 +145,7 @@ func (m *Module) handleDeleteRuleHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"store not open"}`, http.StatusServiceUnavailable)
 		return
 	}
-	if err := m.store.DeleteRule(id); err != nil {
+	if err := m.store.DeleteRule(r.Context(), id); err != nil {
 		http.Error(w, fmtJSONError(err), http.StatusInternalServerError)
 		return
 	}

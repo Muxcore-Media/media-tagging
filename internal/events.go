@@ -52,17 +52,17 @@ func firstNonEmpty(vals ...string) string {
 }
 
 // ApplyFileImported classifies a media.file.imported event payload (merge=true).
-func (m *Module) ApplyFileImported(payload []byte) (mediaID string, tags []*Tag, matched []string, err error) {
+func (m *Module) ApplyFileImported(ctx context.Context, payload []byte) (mediaID string, tags []*Tag, matched []string, err error) {
 	var p contracts.FileImportedPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
-		return "", nil, nil, fmt.Errorf("unmarshal file.imported: %w", err)
+	if unmarshalErr := json.Unmarshal(payload, &p); unmarshalErr != nil {
+		return "", nil, nil, fmt.Errorf("unmarshal file.imported: %w", unmarshalErr)
 	}
 	mediaID = mediaIDFromImport(p)
 	if mediaID == "" {
 		return "", nil, nil, fmt.Errorf("file.imported missing media identity")
 	}
 	path := firstNonEmpty(p.DestinationPath, p.StorageKey, p.OriginalPath)
-	tags, matched, err = m.store.Classify(ClassifyInput{
+	tags, matched, err = m.store.Classify(ctx, ClassifyInput{
 		MediaID:   mediaID,
 		Title:     p.Title,
 		Path:      path,
@@ -73,12 +73,12 @@ func (m *Module) ApplyFileImported(payload []byte) (mediaID string, tags []*Tag,
 }
 
 // ApplyLibraryEvent applies classification for library add/update events.
-func (m *Module) ApplyLibraryEvent(eventType string, payload []byte) (mediaID string, tags []*Tag, matched []string, err error) {
+func (m *Module) ApplyLibraryEvent(ctx context.Context, eventType string, payload []byte) (mediaID string, tags []*Tag, matched []string, err error) {
 	switch eventType {
 	case contracts.EventMovieAdded, contracts.EventMovieUpdated:
 		var p contracts.MovieAddedPayload
-		if err := json.Unmarshal(payload, &p); err != nil {
-			return "", nil, nil, err
+		if unmarshalErr := json.Unmarshal(payload, &p); unmarshalErr != nil {
+			return "", nil, nil, unmarshalErr
 		}
 		mediaID = strings.TrimSpace(p.MovieID)
 		if mediaID == "" && p.TMDBID > 0 {
@@ -87,14 +87,14 @@ func (m *Module) ApplyLibraryEvent(eventType string, payload []byte) (mediaID st
 		if mediaID == "" {
 			return "", nil, nil, fmt.Errorf("movie event missing id")
 		}
-		tags, matched, err = m.store.Classify(ClassifyInput{
+		tags, matched, err = m.store.Classify(ctx, ClassifyInput{
 			MediaID: mediaID, Title: p.Title, MediaType: "movie", Merge: true,
 		})
 		return mediaID, tags, matched, err
 	case contracts.EventTVAdded, contracts.EventTVUpdated:
 		var p contracts.TVAddedPayload
-		if err := json.Unmarshal(payload, &p); err != nil {
-			return "", nil, nil, err
+		if unmarshalErr := json.Unmarshal(payload, &p); unmarshalErr != nil {
+			return "", nil, nil, unmarshalErr
 		}
 		mediaID = strings.TrimSpace(p.SeriesID)
 		if mediaID == "" && p.TMDBID > 0 {
@@ -103,18 +103,18 @@ func (m *Module) ApplyLibraryEvent(eventType string, payload []byte) (mediaID st
 		if mediaID == "" {
 			return "", nil, nil, fmt.Errorf("tv event missing id")
 		}
-		tags, matched, err = m.store.Classify(ClassifyInput{
+		tags, matched, err = m.store.Classify(ctx, ClassifyInput{
 			MediaID: mediaID, Title: p.Name, MediaType: "tv", Merge: true,
 		})
 		return mediaID, tags, matched, err
 	case contracts.EventFileImported:
-		return m.ApplyFileImported(payload)
+		return m.ApplyFileImported(ctx, payload)
 	default:
 		return "", nil, nil, fmt.Errorf("unsupported event type %q", eventType)
 	}
 }
 
-func (m *Module) startEventSubscribe() {
+func (m *Module) startEventSubscribe(ctx context.Context) {
 	m.cfgMu.RLock()
 	enabled := m.eventsEnabled
 	m.cfgMu.RUnlock()
@@ -122,10 +122,10 @@ func (m *Module) startEventSubscribe() {
 		slog.Info("media-tagging: event auto-tag disabled (TAGGING_EVENTS_ENABLED)")
 		return
 	}
-	go m.dialCoreAndSubscribe()
+	go m.dialCoreAndSubscribe(ctx)
 }
 
-func (m *Module) dialCoreAndSubscribe() {
+func (m *Module) dialCoreAndSubscribe(ctx context.Context) {
 	time.Sleep(8 * time.Second)
 	meshAddr := os.Getenv("MUXCORE_GRPC_ADDR")
 	if meshAddr == "" {
@@ -153,19 +153,19 @@ func (m *Module) dialCoreAndSubscribe() {
 		contracts.EventTVAdded,
 		contracts.EventTVUpdated,
 	} {
-		ch, cancel, err := c.Events.Subscribe(context.Background(), et)
+		ch, cancel, err := c.Events.Subscribe(ctx, et)
 		if err != nil {
 			slog.Warn("media-tagging: subscribe", "type", et, "error", err)
 			continue
 		}
-		go m.handleTagEvents(et, ch, cancel)
+		go m.handleTagEvents(ctx, et, ch, cancel)
 		slog.Info("media-tagging: subscribed", "type", et)
 	}
 }
 
-func (m *Module) handleTagEvents(eventType string, ch <-chan *eventsv1.Event, cancel context.CancelFunc) {
+func (m *Module) handleTagEvents(ctx context.Context, eventType string, ch <-chan *eventsv1.Event, cancel context.CancelFunc) {
 	for evt := range ch {
-		mediaID, tags, matched, err := m.ApplyLibraryEvent(eventType, evt.GetPayload())
+		mediaID, tags, matched, err := m.ApplyLibraryEvent(ctx, eventType, evt.GetPayload())
 		if err != nil {
 			slog.Debug("media-tagging: apply event", "type", eventType, "error", err)
 			continue
