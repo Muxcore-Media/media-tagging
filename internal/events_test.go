@@ -49,25 +49,25 @@ func newTestModule(t *testing.T) *Module {
 
 func seedAnimeHorrorRules(t *testing.T, m *Module) (animeID, horrorID string) {
 	t.Helper()
-	anime, err := m.store.CreateTag(Tag{Name: "Anime", Category: "format", Color: "#88f"})
+	anime, err := m.store.CreateTag(t.Context(), Tag{Name: "Anime", Category: "format", Color: "#88f"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	horror, err := m.store.CreateTag(Tag{Name: "Horror", Category: "genre", Color: "#f44"})
+	horror, err := m.store.CreateTag(t.Context(), Tag{Name: "Horror", Category: "genre", Color: "#f44"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.store.UpsertRule(Rule{
+	if _, err := m.store.UpsertRule(t.Context(), Rule{
 		TagID: anime.ID, Field: "path", Match: "contains", Pattern: "/anime/", Enabled: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.store.UpsertRule(Rule{
+	if _, err := m.store.UpsertRule(t.Context(), Rule{
 		TagID: anime.ID, Field: "title", Match: "contains", Pattern: "Cowboy", Enabled: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.store.UpsertRule(Rule{
+	if _, err := m.store.UpsertRule(t.Context(), Rule{
 		TagID: horror.ID, Field: "title", Match: "contains", Pattern: "Thing", Enabled: true,
 	}); err != nil {
 		t.Fatal(err)
@@ -83,7 +83,7 @@ func TestApplyFileImportedFixture(t *testing.T) {
 		t.Fatalf("type=%q", f.Type)
 	}
 
-	mediaID, tags, matched, err := m.ApplyFileImported(f.Payload)
+	mediaID, tags, matched, err := m.ApplyFileImported(t.Context(), f.Payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestApplyFileImportedFixture(t *testing.T) {
 	if !hasTagID(tags, animeID) {
 		t.Fatalf("expected Anime tag, got %+v", tags)
 	}
-	stored, err := m.store.GetItemTags(mediaID)
+	stored, err := m.store.GetItemTags(t.Context(), mediaID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestApplyLibraryEventFixtures(t *testing.T) {
 	animeID, horrorID := seedAnimeHorrorRules(t, m)
 
 	movie := loadEventFixture(t, "movie_added_horror.json")
-	mediaID, tags, matched, err := m.ApplyLibraryEvent(movie.Type, movie.Payload)
+	mediaID, tags, matched, err := m.ApplyLibraryEvent(t.Context(), movie.Type, movie.Payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func TestApplyLibraryEventFixtures(t *testing.T) {
 	}
 
 	tv := loadEventFixture(t, "tv_added_anime.json")
-	mediaID, tags, matched, err = m.ApplyLibraryEvent(tv.Type, tv.Payload)
+	mediaID, tags, matched, err = m.ApplyLibraryEvent(t.Context(), tv.Type, tv.Payload)
 	if err != nil {
 		t.Fatal(err)
 	}

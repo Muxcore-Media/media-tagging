@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -34,7 +35,7 @@ type Store struct {
 }
 
 // OpenStore opens or creates the SQLite database at path (WAL mode).
-func OpenStore(path string) (*Store, error) {
+func OpenStore(ctx context.Context, path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create db directory: %w", err)
 	}
@@ -43,24 +44,24 @@ func OpenStore(path string) (*Store, error) {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
-		db.Close()
+	if _, err := db.ExecContext(ctx, `PRAGMA journal_mode=WAL`); err != nil {
+		_ = db.Close()
 		return nil, fmt.Errorf("enable WAL: %w", err)
 	}
-	if _, err := db.Exec(`PRAGMA foreign_keys=ON`); err != nil {
-		db.Close()
+	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys=ON`); err != nil {
+		_ = db.Close()
 		return nil, fmt.Errorf("enable foreign_keys: %w", err)
 	}
 	s := &Store{db: db}
-	if err := s.migrate(); err != nil {
-		db.Close()
+	if err := s.migrate(ctx); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 	return s, nil
 }
 
-func (s *Store) migrate() error {
-	_, err := s.db.Exec(`
+func (s *Store) migrate(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS tags (
 			id       TEXT PRIMARY KEY,
 			name     TEXT NOT NULL,
@@ -100,14 +101,14 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func (s *Store) CreateTag(t Tag) (*Tag, error) {
+func (s *Store) CreateTag(ctx context.Context, t Tag) (*Tag, error) {
 	if strings.TrimSpace(t.Name) == "" {
 		return nil, fmt.Errorf("tag name required")
 	}
 	if t.ID == "" {
 		t.ID = "tag_" + uuid.NewString()[:8]
 	}
-	_, err := s.db.Exec(
+	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO tags (id, name, category, color) VALUES (?, ?, ?, ?)`,
 		t.ID, t.Name, t.Category, t.Color,
 	)
@@ -118,21 +119,21 @@ func (s *Store) CreateTag(t Tag) (*Tag, error) {
 	return &out, nil
 }
 
-func (s *Store) ListTags(category string) ([]*Tag, error) {
+func (s *Store) ListTags(ctx context.Context, category string) ([]*Tag, error) {
 	var rows *sql.Rows
 	var err error
 	if category != "" {
-		rows, err = s.db.Query(
+		rows, err = s.db.QueryContext(ctx,
 			`SELECT id, name, category, color FROM tags WHERE lower(category) = lower(?) ORDER BY name`,
 			category,
 		)
 	} else {
-		rows, err = s.db.Query(`SELECT id, name, category, color FROM tags ORDER BY name`)
+		rows, err = s.db.QueryContext(ctx, `SELECT id, name, category, color FROM tags ORDER BY name`)
 	}
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make([]*Tag, 0)
 	for rows.Next() {
 		var t Tag
@@ -145,8 +146,8 @@ func (s *Store) ListTags(category string) ([]*Tag, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) DeleteTag(id string) error {
-	res, err := s.db.Exec(`DELETE FROM tags WHERE id = ?`, id)
+func (s *Store) DeleteTag(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM tags WHERE id = ?`, id)
 	if err != nil {
 		return err
 	}
@@ -160,15 +161,15 @@ func (s *Store) DeleteTag(id string) error {
 	return nil
 }
 
-func (s *Store) SetItemTags(mediaID string, tagIDs []string) ([]string, error) {
+func (s *Store) SetItemTags(ctx context.Context, mediaID string, tagIDs []string) ([]string, error) {
 	if strings.TrimSpace(mediaID) == "" {
 		return nil, fmt.Errorf("media_id required")
 	}
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	seen := map[string]struct{}{}
 	unique := make([]string, 0, len(tagIDs))
@@ -177,7 +178,7 @@ func (s *Store) SetItemTags(mediaID string, tagIDs []string) ([]string, error) {
 			continue
 		}
 		var exists int
-		if err := tx.QueryRow(`SELECT 1 FROM tags WHERE id = ?`, id).Scan(&exists); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT 1 FROM tags WHERE id = ?`, id).Scan(&exists); err != nil {
 			if err == sql.ErrNoRows {
 				return nil, fmt.Errorf("tag %q not found", id)
 			}
@@ -187,11 +188,11 @@ func (s *Store) SetItemTags(mediaID string, tagIDs []string) ([]string, error) {
 		unique = append(unique, id)
 	}
 
-	if _, err := tx.Exec(`DELETE FROM item_tags WHERE media_id = ?`, mediaID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM item_tags WHERE media_id = ?`, mediaID); err != nil {
 		return nil, err
 	}
 	for _, id := range unique {
-		if _, err := tx.Exec(`INSERT INTO item_tags (media_id, tag_id) VALUES (?, ?)`, mediaID, id); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO item_tags (media_id, tag_id) VALUES (?, ?)`, mediaID, id); err != nil {
 			return nil, err
 		}
 	}
@@ -201,8 +202,8 @@ func (s *Store) SetItemTags(mediaID string, tagIDs []string) ([]string, error) {
 	return unique, nil
 }
 
-func (s *Store) GetItemTags(mediaID string) ([]*Tag, error) {
-	rows, err := s.db.Query(`
+func (s *Store) GetItemTags(ctx context.Context, mediaID string) ([]*Tag, error) {
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT t.id, t.name, t.category, t.color
 		FROM item_tags it
 		JOIN tags t ON t.id = it.tag_id
@@ -211,7 +212,7 @@ func (s *Store) GetItemTags(mediaID string) ([]*Tag, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make([]*Tag, 0)
 	for rows.Next() {
 		var t Tag
@@ -224,12 +225,12 @@ func (s *Store) GetItemTags(mediaID string) ([]*Tag, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) UpsertRule(r Rule) (*Rule, error) {
+func (s *Store) UpsertRule(ctx context.Context, r Rule) (*Rule, error) {
 	if strings.TrimSpace(r.TagID) == "" || strings.TrimSpace(r.Pattern) == "" {
 		return nil, fmt.Errorf("tag_id and pattern required")
 	}
 	var exists int
-	if err := s.db.QueryRow(`SELECT 1 FROM tags WHERE id = ?`, r.TagID).Scan(&exists); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM tags WHERE id = ?`, r.TagID).Scan(&exists); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("tag %q not found", r.TagID)
 		}
@@ -248,7 +249,7 @@ func (s *Store) UpsertRule(r Rule) (*Rule, error) {
 	if r.Enabled {
 		enabled = 1
 	}
-	_, err := s.db.Exec(`
+	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO rules (id, tag_id, field, match_mode, pattern, enabled)
 		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
@@ -266,13 +267,13 @@ func (s *Store) UpsertRule(r Rule) (*Rule, error) {
 	return &out, nil
 }
 
-func (s *Store) ListRules() ([]*Rule, error) {
-	rows, err := s.db.Query(`
+func (s *Store) ListRules(ctx context.Context) ([]*Rule, error) {
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, tag_id, field, match_mode, pattern, enabled FROM rules ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make([]*Rule, 0)
 	for rows.Next() {
 		var r Rule
@@ -287,8 +288,8 @@ func (s *Store) ListRules() ([]*Rule, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) DeleteRule(id string) error {
-	res, err := s.db.Exec(`DELETE FROM rules WHERE id = ?`, id)
+func (s *Store) DeleteRule(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM rules WHERE id = ?`, id)
 	if err != nil {
 		return err
 	}
@@ -302,7 +303,7 @@ func (s *Store) DeleteRule(id string) error {
 	return nil
 }
 
-type ClassifyInput struct {
+type ClassifyInput struct { //nolint:govet // fieldalignment: input fields grouped for readability
 	MediaID   string
 	Title     string
 	Genres    []string
@@ -311,38 +312,38 @@ type ClassifyInput struct {
 	Merge     bool
 }
 
-func (s *Store) Classify(in ClassifyInput) (tags []*Tag, matched []string, err error) {
+func (s *Store) Classify(ctx context.Context, in ClassifyInput) (tags []*Tag, matched []string, err error) {
 	if strings.TrimSpace(in.MediaID) == "" {
 		return nil, nil, fmt.Errorf("media_id required")
 	}
 
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	hit := map[string]struct{}{}
 	if in.Merge {
-		rows, err := tx.Query(`SELECT tag_id FROM item_tags WHERE media_id = ?`, in.MediaID)
-		if err != nil {
-			return nil, nil, err
+		mergeRows, mergeErr := tx.QueryContext(ctx, `SELECT tag_id FROM item_tags WHERE media_id = ?`, in.MediaID)
+		if mergeErr != nil {
+			return nil, nil, mergeErr
 		}
-		for rows.Next() {
+		for mergeRows.Next() {
 			var id string
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return nil, nil, err
+			if scanErr := mergeRows.Scan(&id); scanErr != nil {
+				_ = mergeRows.Close()
+				return nil, nil, scanErr
 			}
 			hit[id] = struct{}{}
 		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return nil, nil, err
+		_ = mergeRows.Close()
+		if mergeErr := mergeRows.Err(); mergeErr != nil {
+			return nil, nil, mergeErr
 		}
 	}
 
-	rules, err := listRulesTx(tx)
+	rules, err := listRulesTx(ctx, tx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -358,11 +359,11 @@ func (s *Store) Classify(in ClassifyInput) (tags []*Tag, matched []string, err e
 		matched = append(matched, r.ID)
 	}
 
-	if _, err := tx.Exec(`DELETE FROM item_tags WHERE media_id = ?`, in.MediaID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM item_tags WHERE media_id = ?`, in.MediaID); err != nil {
 		return nil, nil, err
 	}
 	for id := range hit {
-		if _, err := tx.Exec(`INSERT INTO item_tags (media_id, tag_id) VALUES (?, ?)`, in.MediaID, id); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO item_tags (media_id, tag_id) VALUES (?, ?)`, in.MediaID, id); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -372,7 +373,7 @@ func (s *Store) Classify(in ClassifyInput) (tags []*Tag, matched []string, err e
 
 	tags = make([]*Tag, 0, len(hit))
 	for id := range hit {
-		t, err := s.getTag(id)
+		t, err := s.getTag(ctx, id)
 		if err != nil {
 			continue
 		}
@@ -381,12 +382,12 @@ func (s *Store) Classify(in ClassifyInput) (tags []*Tag, matched []string, err e
 	return tags, matched, nil
 }
 
-func listRulesTx(tx *sql.Tx) ([]*Rule, error) {
-	rows, err := tx.Query(`SELECT id, tag_id, field, match_mode, pattern, enabled FROM rules`)
+func listRulesTx(ctx context.Context, tx *sql.Tx) ([]*Rule, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id, tag_id, field, match_mode, pattern, enabled FROM rules`)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make([]*Rule, 0)
 	for rows.Next() {
 		var r Rule
@@ -401,9 +402,9 @@ func listRulesTx(tx *sql.Tx) ([]*Rule, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) getTag(id string) (*Tag, error) {
+func (s *Store) getTag(ctx context.Context, id string) (*Tag, error) {
 	var t Tag
-	err := s.db.QueryRow(
+	err := s.db.QueryRowContext(ctx,
 		`SELECT id, name, category, color FROM tags WHERE id = ?`, id,
 	).Scan(&t.ID, &t.Name, &t.Category, &t.Color)
 	if err != nil {

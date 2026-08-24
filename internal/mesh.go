@@ -19,7 +19,7 @@ const (
 	meshMethodDeleteRule = "DeleteRule"
 )
 
-type taggingMeshServer struct {
+type taggingMeshServer struct { //nolint:govet // fieldalignment: mesh handler fields grouped for readability
 	meshv1.UnimplementedModuleMeshServer
 	moduleID string
 	settings modulesdk.SettingsHandler
@@ -46,7 +46,7 @@ func (s *taggingMeshServer) Call(ctx context.Context, req *meshv1.CallRequest) (
 		defs := s.settings.List()
 		raw, err := json.Marshal(defs)
 		if err != nil {
-			return &meshv1.CallResponse{Error: err.Error()}, nil
+			return meshCallError(err)
 		}
 		return &meshv1.CallResponse{Payload: raw}, nil
 	case "UpdateSetting":
@@ -66,19 +66,19 @@ func (s *taggingMeshServer) Call(ctx context.Context, req *meshv1.CallRequest) (
 			return &meshv1.CallResponse{Error: "UpdateSetting requires Key"}, nil
 		}
 		if err := s.settings.Update(body.Key, body.Value); err != nil {
-			return &meshv1.CallResponse{Error: err.Error()}, nil
+			return meshCallError(err)
 		}
 		return &meshv1.CallResponse{Payload: []byte(`{"ok":true}`)}, nil
 	case meshMethodListTags:
-		return s.listTags(req.GetPayload())
+		return s.listTags(ctx, req.GetPayload())
 	case meshMethodCreateTag:
-		return s.createTag(req.GetPayload())
+		return s.createTag(ctx, req.GetPayload())
 	case meshMethodListRules:
-		return s.listRules()
+		return s.listRules(ctx)
 	case meshMethodUpsertRule:
-		return s.upsertRule(req.GetPayload())
+		return s.upsertRule(ctx, req.GetPayload())
 	case meshMethodDeleteRule:
-		return s.deleteRule(req.GetPayload())
+		return s.deleteRule(ctx, req.GetPayload())
 	default:
 		return &meshv1.CallResponse{Error: fmt.Sprintf("unknown method %q", req.GetMethod())}, nil
 	}
@@ -88,7 +88,11 @@ func (s *taggingMeshServer) StreamCall(stream meshv1.ModuleMesh_StreamCallServer
 	return fmt.Errorf("StreamCall not supported for tagging mesh handler")
 }
 
-func (s *taggingMeshServer) listTags(payload []byte) (*meshv1.CallResponse, error) {
+func meshCallError(err error) (*meshv1.CallResponse, error) {
+	return &meshv1.CallResponse{Error: err.Error()}, nil
+}
+
+func (s *taggingMeshServer) listTags(ctx context.Context, payload []byte) (*meshv1.CallResponse, error) {
 	var body struct {
 		Category string `json:"category"`
 	}
@@ -100,9 +104,9 @@ func (s *taggingMeshServer) listTags(payload []byte) (*meshv1.CallResponse, erro
 	if s.m.store == nil {
 		return &meshv1.CallResponse{Error: "store not open"}, nil
 	}
-	items, err := s.m.store.ListTags(body.Category)
+	items, err := s.m.store.ListTags(ctx, body.Category)
 	if err != nil {
-		return &meshv1.CallResponse{Error: err.Error()}, nil
+		return meshCallError(err)
 	}
 	out := make([]tagJSON, 0, len(items))
 	for _, t := range items {
@@ -110,12 +114,12 @@ func (s *taggingMeshServer) listTags(payload []byte) (*meshv1.CallResponse, erro
 	}
 	raw, err := json.Marshal(out)
 	if err != nil {
-		return &meshv1.CallResponse{Error: err.Error()}, nil
+		return meshCallError(err)
 	}
 	return &meshv1.CallResponse{Payload: raw}, nil
 }
 
-func (s *taggingMeshServer) createTag(payload []byte) (*meshv1.CallResponse, error) {
+func (s *taggingMeshServer) createTag(ctx context.Context, payload []byte) (*meshv1.CallResponse, error) {
 	var body struct {
 		Name     string `json:"name"`
 		Category string `json:"category"`
@@ -136,24 +140,24 @@ func (s *taggingMeshServer) createTag(payload []byte) (*meshv1.CallResponse, err
 		cat = s.m.defaultCategory
 		s.m.cfgMu.RUnlock()
 	}
-	t, err := s.m.store.CreateTag(Tag{Name: body.Name, Category: cat, Color: body.Color})
+	t, err := s.m.store.CreateTag(ctx, Tag{Name: body.Name, Category: cat, Color: body.Color})
 	if err != nil {
-		return &meshv1.CallResponse{Error: err.Error()}, nil
+		return meshCallError(err)
 	}
 	raw, err := json.Marshal(toTagJSON(t))
 	if err != nil {
-		return &meshv1.CallResponse{Error: err.Error()}, nil
+		return meshCallError(err)
 	}
 	return &meshv1.CallResponse{Payload: raw}, nil
 }
 
-func (s *taggingMeshServer) listRules() (*meshv1.CallResponse, error) {
+func (s *taggingMeshServer) listRules(ctx context.Context) (*meshv1.CallResponse, error) {
 	if s.m.store == nil {
 		return &meshv1.CallResponse{Error: "store not open"}, nil
 	}
-	items, err := s.m.store.ListRules()
+	items, err := s.m.store.ListRules(ctx)
 	if err != nil {
-		return &meshv1.CallResponse{Error: err.Error()}, nil
+		return meshCallError(err)
 	}
 	out := make([]ruleJSON, 0, len(items))
 	for _, r := range items {
@@ -161,13 +165,13 @@ func (s *taggingMeshServer) listRules() (*meshv1.CallResponse, error) {
 	}
 	raw, err := json.Marshal(out)
 	if err != nil {
-		return &meshv1.CallResponse{Error: err.Error()}, nil
+		return meshCallError(err)
 	}
 	return &meshv1.CallResponse{Payload: raw}, nil
 }
 
-func (s *taggingMeshServer) upsertRule(payload []byte) (*meshv1.CallResponse, error) {
-	var body struct {
+func (s *taggingMeshServer) upsertRule(ctx context.Context, payload []byte) (*meshv1.CallResponse, error) {
+	var body struct { //nolint:govet // fieldalignment: JSON field order for mesh requests
 		ID      string `json:"id"`
 		TagID   string `json:"tag_id"`
 		Field   string `json:"field"`
@@ -196,21 +200,21 @@ func (s *taggingMeshServer) upsertRule(payload []byte) (*meshv1.CallResponse, er
 	if match == "" {
 		match = "contains"
 	}
-	rule, err := s.m.store.UpsertRule(Rule{
+	rule, err := s.m.store.UpsertRule(ctx, Rule{
 		ID: body.ID, TagID: body.TagID, Field: field,
 		Match: match, Pattern: body.Pattern, Enabled: enabled,
 	})
 	if err != nil {
-		return &meshv1.CallResponse{Error: err.Error()}, nil
+		return meshCallError(err)
 	}
 	raw, err := json.Marshal(toRuleJSON(rule))
 	if err != nil {
-		return &meshv1.CallResponse{Error: err.Error()}, nil
+		return meshCallError(err)
 	}
 	return &meshv1.CallResponse{Payload: raw}, nil
 }
 
-func (s *taggingMeshServer) deleteRule(payload []byte) (*meshv1.CallResponse, error) {
+func (s *taggingMeshServer) deleteRule(ctx context.Context, payload []byte) (*meshv1.CallResponse, error) {
 	var body struct {
 		ID string `json:"id"`
 	}
@@ -223,8 +227,8 @@ func (s *taggingMeshServer) deleteRule(payload []byte) (*meshv1.CallResponse, er
 	if s.m.store == nil {
 		return &meshv1.CallResponse{Error: "store not open"}, nil
 	}
-	if err := s.m.store.DeleteRule(body.ID); err != nil {
-		return &meshv1.CallResponse{Error: err.Error()}, nil
+	if err := s.m.store.DeleteRule(ctx, body.ID); err != nil {
+		return meshCallError(err)
 	}
 	return &meshv1.CallResponse{Payload: []byte(`{"success":true}`)}, nil
 }

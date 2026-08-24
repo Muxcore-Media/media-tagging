@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 
@@ -17,7 +18,7 @@ import (
 	taggingv1 "github.com/Muxcore-Media/media-tagging/proto/gen/muxcore/tagging/v1"
 )
 
-type Module struct {
+type Module struct { //nolint:govet // fieldalignment: lifecycle fields grouped for readability
 	id, grpcAddr, httpAddr string
 	dataDir                string
 	defaultCategory        string
@@ -32,7 +33,7 @@ type Module struct {
 	mc     *client.Client
 }
 
-type Config struct {
+type Config struct { //nolint:govet // fieldalignment: config fields grouped for readability
 	ID, DefaultCategory, DataDir, GRPCAddr, HTTPAddr string
 	EventsEnabled                                    *bool
 }
@@ -94,7 +95,7 @@ func (m *Module) Init(ctx context.Context) error {
 		return fmt.Errorf("create data dir: %w", err)
 	}
 	dbPath := filepath.Join(m.dataDir, "tagging.db")
-	store, err := OpenStore(dbPath)
+	store, err := OpenStore(ctx, dbPath)
 	if err != nil {
 		return err
 	}
@@ -107,7 +108,8 @@ func (m *Module) Start(ctx context.Context) error {
 	if m.store == nil {
 		return fmt.Errorf("store not initialized")
 	}
-	lis, err := net.Listen("tcp", m.grpcAddr)
+	var lc net.ListenConfig
+	lis, err := lc.Listen(ctx, "tcp", m.grpcAddr)
 	if err != nil {
 		return fmt.Errorf("listen gRPC %s: %w", m.grpcAddr, err)
 	}
@@ -118,8 +120,8 @@ func (m *Module) Start(ctx context.Context) error {
 	registerTaggingMesh(m.grpcSrv, m.id, m)
 	go func() {
 		slog.Info("tagging gRPC listening", "addr", m.grpcAddr)
-		if err := m.grpcSrv.Serve(lis); err != nil {
-			slog.Error("gRPC serve", "error", err)
+		if serveErr := m.grpcSrv.Serve(lis); serveErr != nil {
+			slog.Error("gRPC serve", "error", serveErr)
 		}
 	}()
 	mux := http.NewServeMux()
@@ -128,19 +130,22 @@ func (m *Module) Start(ctx context.Context) error {
 		_, _ = w.Write([]byte("ok"))
 	})
 	m.registerTaggingHTTPAPI(mux)
-	httpLis, err := net.Listen("tcp", m.httpAddr)
+	httpLis, err := lc.Listen(ctx, "tcp", m.httpAddr)
 	if err != nil {
 		return fmt.Errorf("listen HTTP %s: %w", m.httpAddr, err)
 	}
 	m.httpAddr = httpLis.Addr().String()
-	m.httpSrv = &http.Server{Handler: mux}
+	m.httpSrv = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 	go func() {
 		slog.Info("health listening", "addr", m.httpAddr)
-		if err := m.httpSrv.Serve(httpLis); err != nil && err != http.ErrServerClosed {
-			slog.Error("health serve", "error", err)
+		if serveErr := m.httpSrv.Serve(httpLis); serveErr != nil && serveErr != http.ErrServerClosed {
+			slog.Error("health serve", "error", serveErr)
 		}
 	}()
-	m.startEventSubscribe()
+	m.startEventSubscribe(ctx)
 	return nil
 }
 
@@ -176,22 +181,22 @@ type tagServer struct {
 	m *Module
 }
 
-func (s *tagServer) CreateTag(_ context.Context, req *taggingv1.CreateTagRequest) (*taggingv1.CreateTagResponse, error) {
+func (s *tagServer) CreateTag(ctx context.Context, req *taggingv1.CreateTagRequest) (*taggingv1.CreateTagResponse, error) {
 	cat := req.GetCategory()
 	if cat == "" {
 		s.m.cfgMu.RLock()
 		cat = s.m.defaultCategory
 		s.m.cfgMu.RUnlock()
 	}
-	t, err := s.m.store.CreateTag(Tag{Name: req.GetName(), Category: cat, Color: req.GetColor()})
+	t, err := s.m.store.CreateTag(ctx, Tag{Name: req.GetName(), Category: cat, Color: req.GetColor()})
 	if err != nil {
 		return nil, err
 	}
 	return &taggingv1.CreateTagResponse{Tag: toPBTag(t)}, nil
 }
 
-func (s *tagServer) ListTags(_ context.Context, req *taggingv1.ListTagsRequest) (*taggingv1.ListTagsResponse, error) {
-	items, err := s.m.store.ListTags(req.GetCategory())
+func (s *tagServer) ListTags(ctx context.Context, req *taggingv1.ListTagsRequest) (*taggingv1.ListTagsResponse, error) {
+	items, err := s.m.store.ListTags(ctx, req.GetCategory())
 	if err != nil {
 		return nil, err
 	}
@@ -202,23 +207,23 @@ func (s *tagServer) ListTags(_ context.Context, req *taggingv1.ListTagsRequest) 
 	return &taggingv1.ListTagsResponse{Tags: out}, nil
 }
 
-func (s *tagServer) DeleteTag(_ context.Context, req *taggingv1.DeleteTagRequest) (*taggingv1.DeleteTagResponse, error) {
-	if err := s.m.store.DeleteTag(req.GetId()); err != nil {
+func (s *tagServer) DeleteTag(ctx context.Context, req *taggingv1.DeleteTagRequest) (*taggingv1.DeleteTagResponse, error) {
+	if err := s.m.store.DeleteTag(ctx, req.GetId()); err != nil {
 		return nil, err
 	}
 	return &taggingv1.DeleteTagResponse{Success: true}, nil
 }
 
-func (s *tagServer) SetItemTags(_ context.Context, req *taggingv1.SetItemTagsRequest) (*taggingv1.SetItemTagsResponse, error) {
-	ids, err := s.m.store.SetItemTags(req.GetMediaId(), req.GetTagIds())
+func (s *tagServer) SetItemTags(ctx context.Context, req *taggingv1.SetItemTagsRequest) (*taggingv1.SetItemTagsResponse, error) {
+	ids, err := s.m.store.SetItemTags(ctx, req.GetMediaId(), req.GetTagIds())
 	if err != nil {
 		return nil, err
 	}
 	return &taggingv1.SetItemTagsResponse{TagIds: ids}, nil
 }
 
-func (s *tagServer) GetItemTags(_ context.Context, req *taggingv1.GetItemTagsRequest) (*taggingv1.GetItemTagsResponse, error) {
-	items, err := s.m.store.GetItemTags(req.GetMediaId())
+func (s *tagServer) GetItemTags(ctx context.Context, req *taggingv1.GetItemTagsRequest) (*taggingv1.GetItemTagsResponse, error) {
+	items, err := s.m.store.GetItemTags(ctx, req.GetMediaId())
 	if err != nil {
 		return nil, err
 	}
@@ -229,8 +234,8 @@ func (s *tagServer) GetItemTags(_ context.Context, req *taggingv1.GetItemTagsReq
 	return &taggingv1.GetItemTagsResponse{MediaId: req.GetMediaId(), Tags: out}, nil
 }
 
-func (s *tagServer) UpsertRule(_ context.Context, req *taggingv1.UpsertRuleRequest) (*taggingv1.UpsertRuleResponse, error) {
-	r, err := s.m.store.UpsertRule(Rule{
+func (s *tagServer) UpsertRule(ctx context.Context, req *taggingv1.UpsertRuleRequest) (*taggingv1.UpsertRuleResponse, error) {
+	r, err := s.m.store.UpsertRule(ctx, Rule{
 		ID: req.GetId(), TagID: req.GetTagId(), Field: req.GetField(),
 		Match: req.GetMatch(), Pattern: req.GetPattern(), Enabled: req.GetEnabled(),
 	})
@@ -240,8 +245,8 @@ func (s *tagServer) UpsertRule(_ context.Context, req *taggingv1.UpsertRuleReque
 	return &taggingv1.UpsertRuleResponse{Rule: toPBRule(r)}, nil
 }
 
-func (s *tagServer) ListRules(_ context.Context, _ *taggingv1.ListRulesRequest) (*taggingv1.ListRulesResponse, error) {
-	items, err := s.m.store.ListRules()
+func (s *tagServer) ListRules(ctx context.Context, _ *taggingv1.ListRulesRequest) (*taggingv1.ListRulesResponse, error) {
+	items, err := s.m.store.ListRules(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -252,15 +257,15 @@ func (s *tagServer) ListRules(_ context.Context, _ *taggingv1.ListRulesRequest) 
 	return &taggingv1.ListRulesResponse{Rules: out}, nil
 }
 
-func (s *tagServer) DeleteRule(_ context.Context, req *taggingv1.DeleteRuleRequest) (*taggingv1.DeleteRuleResponse, error) {
-	if err := s.m.store.DeleteRule(req.GetId()); err != nil {
+func (s *tagServer) DeleteRule(ctx context.Context, req *taggingv1.DeleteRuleRequest) (*taggingv1.DeleteRuleResponse, error) {
+	if err := s.m.store.DeleteRule(ctx, req.GetId()); err != nil {
 		return nil, err
 	}
 	return &taggingv1.DeleteRuleResponse{Success: true}, nil
 }
 
-func (s *tagServer) Classify(_ context.Context, req *taggingv1.ClassifyRequest) (*taggingv1.ClassifyResponse, error) {
-	tags, matched, err := s.m.store.Classify(ClassifyInput{
+func (s *tagServer) Classify(ctx context.Context, req *taggingv1.ClassifyRequest) (*taggingv1.ClassifyResponse, error) {
+	tags, matched, err := s.m.store.Classify(ctx, ClassifyInput{
 		MediaID: req.GetMediaId(), Title: req.GetTitle(), Genres: req.GetGenres(),
 		Path: req.GetPath(), MediaType: req.GetMediaType(), Merge: req.GetMerge(),
 	})
