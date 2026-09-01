@@ -1,0 +1,8 @@
+{
+  "type": "media.tv.removed",
+  "payload": {
+    "name": "Cowboy Bebop",
+    "series_id": "tv_bebop",
+    "tmdb_id": 30991
+  }
+}

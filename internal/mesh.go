@@ -12,11 +12,15 @@ import (
 )
 
 const (
-	meshMethodListTags   = "ListTags"
-	meshMethodCreateTag  = "CreateTag"
-	meshMethodListRules  = "ListRules"
-	meshMethodUpsertRule = "UpsertRule"
-	meshMethodDeleteRule = "DeleteRule"
+	meshMethodListTags    = "ListTags"
+	meshMethodCreateTag   = "CreateTag"
+	meshMethodDeleteTag   = "DeleteTag"
+	meshMethodGetItemTags = "GetItemTags"
+	meshMethodSetItemTags = "SetItemTags"
+	meshMethodClassify    = "Classify"
+	meshMethodListRules   = "ListRules"
+	meshMethodUpsertRule  = "UpsertRule"
+	meshMethodDeleteRule  = "DeleteRule"
 )
 
 type taggingMeshServer struct { //nolint:govet // fieldalignment: mesh handler fields grouped for readability
@@ -73,6 +77,14 @@ func (s *taggingMeshServer) Call(ctx context.Context, req *meshv1.CallRequest) (
 		return s.listTags(ctx, req.GetPayload())
 	case meshMethodCreateTag:
 		return s.createTag(ctx, req.GetPayload())
+	case meshMethodDeleteTag:
+		return s.deleteTag(ctx, req.GetPayload())
+	case meshMethodGetItemTags:
+		return s.getItemTags(ctx, req.GetPayload())
+	case meshMethodSetItemTags:
+		return s.setItemTags(ctx, req.GetPayload())
+	case meshMethodClassify:
+		return s.classify(ctx, req.GetPayload())
 	case meshMethodListRules:
 		return s.listRules(ctx)
 	case meshMethodUpsertRule:
@@ -145,6 +157,104 @@ func (s *taggingMeshServer) createTag(ctx context.Context, payload []byte) (*mes
 		return meshCallError(err)
 	}
 	raw, err := json.Marshal(toTagJSON(t))
+	if err != nil {
+		return meshCallError(err)
+	}
+	return &meshv1.CallResponse{Payload: raw}, nil
+}
+
+func (s *taggingMeshServer) deleteTag(ctx context.Context, payload []byte) (*meshv1.CallResponse, error) {
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return &meshv1.CallResponse{Error: fmt.Sprintf("invalid DeleteTag payload: %v", err)}, nil
+	}
+	if body.ID == "" {
+		return &meshv1.CallResponse{Error: "DeleteTag requires id"}, nil
+	}
+	if err := s.m.store.DeleteTag(ctx, body.ID); err != nil {
+		return meshCallError(err)
+	}
+	return &meshv1.CallResponse{Payload: []byte(`{"success":true}`)}, nil
+}
+
+func (s *taggingMeshServer) getItemTags(ctx context.Context, payload []byte) (*meshv1.CallResponse, error) {
+	var body struct {
+		MediaID string `json:"media_id"`
+	}
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return &meshv1.CallResponse{Error: fmt.Sprintf("invalid GetItemTags payload: %v", err)}, nil
+	}
+	if body.MediaID == "" {
+		return &meshv1.CallResponse{Error: "GetItemTags requires media_id"}, nil
+	}
+	items, err := s.m.store.GetItemTags(ctx, body.MediaID)
+	if err != nil {
+		return meshCallError(err)
+	}
+	out := make([]tagJSON, 0, len(items))
+	for _, t := range items {
+		out = append(out, toTagJSON(t))
+	}
+	raw, err := json.Marshal(map[string]any{"media_id": body.MediaID, "tags": out})
+	if err != nil {
+		return meshCallError(err)
+	}
+	return &meshv1.CallResponse{Payload: raw}, nil
+}
+
+func (s *taggingMeshServer) setItemTags(ctx context.Context, payload []byte) (*meshv1.CallResponse, error) {
+	var body struct {
+		MediaID string   `json:"media_id"`
+		TagIDs  []string `json:"tag_ids"`
+	}
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return &meshv1.CallResponse{Error: fmt.Sprintf("invalid SetItemTags payload: %v", err)}, nil
+	}
+	if body.MediaID == "" {
+		return &meshv1.CallResponse{Error: "SetItemTags requires media_id"}, nil
+	}
+	ids, err := s.m.store.SetItemTags(ctx, body.MediaID, body.TagIDs)
+	if err != nil {
+		return meshCallError(err)
+	}
+	raw, err := json.Marshal(map[string]any{"media_id": body.MediaID, "tag_ids": ids})
+	if err != nil {
+		return meshCallError(err)
+	}
+	return &meshv1.CallResponse{Payload: raw}, nil
+}
+
+func (s *taggingMeshServer) classify(ctx context.Context, payload []byte) (*meshv1.CallResponse, error) {
+	var body struct { //nolint:govet // fieldalignment: JSON field order for classify request
+		MediaID   string   `json:"media_id"`
+		Title     string   `json:"title"`
+		Genres    []string `json:"genres"`
+		Path      string   `json:"path"`
+		MediaType string   `json:"media_type"`
+		Merge     bool     `json:"merge"`
+	}
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return &meshv1.CallResponse{Error: fmt.Sprintf("invalid Classify payload: %v", err)}, nil
+	}
+	if body.MediaID == "" {
+		return &meshv1.CallResponse{Error: "Classify requires media_id"}, nil
+	}
+	tags, matched, err := s.m.store.Classify(ctx, ClassifyInput{
+		MediaID: body.MediaID, Title: body.Title, Genres: body.Genres,
+		Path: body.Path, MediaType: body.MediaType, Merge: body.Merge,
+	})
+	if err != nil {
+		return meshCallError(err)
+	}
+	out := make([]tagJSON, 0, len(tags))
+	for _, t := range tags {
+		out = append(out, toTagJSON(t))
+	}
+	raw, err := json.Marshal(map[string]any{
+		"media_id": body.MediaID, "tags": out, "matched_rule_ids": matched,
+	})
 	if err != nil {
 		return meshCallError(err)
 	}

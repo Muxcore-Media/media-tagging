@@ -1,0 +1,8 @@
+{
+  "type": "media.movie.removed",
+  "payload": {
+    "title": "The Thing",
+    "movie_id": "mv_thing",
+    "tmdb_id": 1091
+  }
+}

@@ -3,6 +3,7 @@ package internal
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,15 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+var (
+	allowedRuleFields = map[string]struct{}{
+		"title": {}, "genre": {}, "path": {}, "media_type": {},
+	}
+	allowedRuleMatches = map[string]struct{}{
+		"contains": {}, "equals": {}, "prefix": {}, "regex": {},
+	}
+)
+
 type Tag struct {
 	ID       string
 	Name     string
@@ -20,13 +30,14 @@ type Tag struct {
 	Color    string
 }
 
-type Rule struct {
+type Rule struct { //nolint:govet // fieldalignment: persisted rule fields grouped for readability
 	ID      string
 	TagID   string
 	Field   string
 	Match   string
 	Pattern string
 	Enabled bool
+	regex   *regexp.Regexp
 }
 
 // Store persists tags, rules, and item tag assignments in SQLite.
@@ -83,14 +94,37 @@ func (s *Store) migrate(ctx context.Context) error {
 			PRIMARY KEY (media_id, tag_id),
 			FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
 		);
+		CREATE TABLE IF NOT EXISTS media_aliases (
+			alias    TEXT PRIMARY KEY,
+			media_id TEXT NOT NULL
+		);
 		CREATE INDEX IF NOT EXISTS idx_tags_category ON tags(category);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_name_category ON tags(name COLLATE NOCASE, category COLLATE NOCASE);
 		CREATE INDEX IF NOT EXISTS idx_rules_tag ON rules(tag_id);
 		CREATE INDEX IF NOT EXISTS idx_item_tags_media ON item_tags(media_id);
+		CREATE INDEX IF NOT EXISTS idx_media_aliases_media ON media_aliases(media_id);
 	`)
 	if err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
 	return nil
+}
+
+// Ping verifies the database connection is alive.
+func (s *Store) Ping(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("store not open")
+	}
+	return s.db.PingContext(ctx)
+}
+
+// Checkpoint flushes WAL pages for backup snapshots.
+func (s *Store) Checkpoint(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("store not open")
+	}
+	_, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
+	return err
 }
 
 // Close closes the database.
@@ -101,14 +135,54 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+func newTagID() string  { return "tag_" + uuid.NewString() }
+func newRuleID() string { return "rule_" + uuid.NewString() }
+
+func validateRuleField(field string) error {
+	if _, ok := allowedRuleFields[strings.ToLower(strings.TrimSpace(field))]; !ok {
+		return fmt.Errorf("invalid field %q (allowed: title, genre, path, media_type)", field)
+	}
+	return nil
+}
+
+func validateRuleMatch(match string) error {
+	if _, ok := allowedRuleMatches[strings.ToLower(strings.TrimSpace(match))]; !ok {
+		return fmt.Errorf("invalid match %q (allowed: contains, equals, prefix, regex)", match)
+	}
+	return nil
+}
+
+func compileRuleRegex(pattern string) (*regexp.Regexp, error) {
+	re, err := regexp.Compile("(?i)" + pattern)
+	if err != nil {
+		return nil, fmt.Errorf("invalid regex pattern: %w", err)
+	}
+	return re, nil
+}
+
 func (s *Store) CreateTag(ctx context.Context, t Tag) (*Tag, error) {
-	if strings.TrimSpace(t.Name) == "" {
+	name := strings.TrimSpace(t.Name)
+	if name == "" {
 		return nil, fmt.Errorf("tag name required")
 	}
-	if t.ID == "" {
-		t.ID = "tag_" + uuid.NewString()[:8]
+	category := strings.TrimSpace(t.Category)
+	var exists int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT 1 FROM tags WHERE name = ? COLLATE NOCASE AND category = ? COLLATE NOCASE`,
+		name, category,
+	).Scan(&exists)
+	if err == nil {
+		return nil, fmt.Errorf("tag %q already exists in category %q", name, category)
 	}
-	_, err := s.db.ExecContext(ctx,
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	if t.ID == "" {
+		t.ID = newTagID()
+	}
+	t.Name = name
+	t.Category = category
+	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO tags (id, name, category, color) VALUES (?, ?, ?, ?)`,
 		t.ID, t.Name, t.Category, t.Color,
 	)
@@ -156,15 +230,108 @@ func (s *Store) DeleteTag(ctx context.Context, id string) error {
 		return err
 	}
 	if n == 0 {
-		return fmt.Errorf("tag %q not found", id)
+		return fmt.Errorf("%w: tag %q", ErrNotFound, id)
 	}
 	return nil
 }
 
+func (s *Store) RegisterAlias(ctx context.Context, alias, mediaID string) error {
+	alias = strings.TrimSpace(alias)
+	mediaID = strings.TrimSpace(mediaID)
+	if alias == "" || mediaID == "" || alias == mediaID {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO media_aliases (alias, media_id) VALUES (?, ?)
+		ON CONFLICT(alias) DO UPDATE SET media_id = excluded.media_id`,
+		alias, mediaID,
+	)
+	return err
+}
+
+func (s *Store) ResolveMediaID(ctx context.Context, mediaID string) (string, error) {
+	mediaID = strings.TrimSpace(mediaID)
+	if mediaID == "" {
+		return "", fmt.Errorf("media_id required")
+	}
+	var canonical string
+	err := s.db.QueryRowContext(ctx, `SELECT media_id FROM media_aliases WHERE alias = ?`, mediaID).Scan(&canonical)
+	if err == sql.ErrNoRows {
+		return mediaID, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return canonical, nil
+}
+
+func (s *Store) aliasesForMedia(ctx context.Context, mediaID string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT alias FROM media_aliases WHERE media_id = ?`, mediaID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := make([]string, 0)
+	for rows.Next() {
+		var alias string
+		if err := rows.Scan(&alias); err != nil {
+			return nil, err
+		}
+		out = append(out, alias)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) MergeItemTags(ctx context.Context, fromAlias, toMediaID string) error {
+	fromAlias = strings.TrimSpace(fromAlias)
+	toMediaID = strings.TrimSpace(toMediaID)
+	if fromAlias == "" || toMediaID == "" || fromAlias == toMediaID {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `SELECT tag_id FROM item_tags WHERE media_id = ?`, fromAlias)
+	if err != nil {
+		return err
+	}
+	tagIDs := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		tagIDs = append(tagIDs, id)
+	}
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, tagID := range tagIDs {
+		_, _ = tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO item_tags (media_id, tag_id) VALUES (?, ?)`, toMediaID, tagID)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM item_tags WHERE media_id = ?`, fromAlias); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) SetItemTags(ctx context.Context, mediaID string, tagIDs []string) ([]string, error) {
-	if strings.TrimSpace(mediaID) == "" {
+	mediaID = strings.TrimSpace(mediaID)
+	if mediaID == "" {
 		return nil, fmt.Errorf("media_id required")
 	}
+	resolved, err := s.ResolveMediaID(ctx, mediaID)
+	if err != nil {
+		return nil, err
+	}
+	mediaID = resolved
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -180,7 +347,7 @@ func (s *Store) SetItemTags(ctx context.Context, mediaID string, tagIDs []string
 		var exists int
 		if err := tx.QueryRowContext(ctx, `SELECT 1 FROM tags WHERE id = ?`, id).Scan(&exists); err != nil {
 			if err == sql.ErrNoRows {
-				return nil, fmt.Errorf("tag %q not found", id)
+				return nil, fmt.Errorf("%w: tag %q", ErrNotFound, id)
 			}
 			return nil, err
 		}
@@ -203,12 +370,16 @@ func (s *Store) SetItemTags(ctx context.Context, mediaID string, tagIDs []string
 }
 
 func (s *Store) GetItemTags(ctx context.Context, mediaID string) ([]*Tag, error) {
+	resolved, err := s.ResolveMediaID(ctx, mediaID)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT t.id, t.name, t.category, t.color
 		FROM item_tags it
 		JOIN tags t ON t.id = it.tag_id
 		WHERE it.media_id = ?
-		ORDER BY t.name`, mediaID)
+		ORDER BY t.name`, resolved)
 	if err != nil {
 		return nil, err
 	}
@@ -225,26 +396,81 @@ func (s *Store) GetItemTags(ctx context.Context, mediaID string) ([]*Tag, error)
 	return out, rows.Err()
 }
 
+func (s *Store) DeleteItemTagsForMedia(ctx context.Context, mediaID string, aliases ...string) error {
+	mediaID = strings.TrimSpace(mediaID)
+	ids := []string{mediaID}
+	ids = append(ids, aliases...)
+	known, err := s.aliasesForMedia(ctx, mediaID)
+	if err != nil {
+		return err
+	}
+	ids = append(ids, known...)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	seen := map[string]struct{}{}
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM item_tags WHERE media_id = ?`, id); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM media_aliases WHERE alias = ? OR media_id = ?`, id, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *Store) UpsertRule(ctx context.Context, r Rule) (*Rule, error) {
 	if strings.TrimSpace(r.TagID) == "" || strings.TrimSpace(r.Pattern) == "" {
 		return nil, fmt.Errorf("tag_id and pattern required")
 	}
+	field := strings.ToLower(strings.TrimSpace(r.Field))
+	if field == "" {
+		field = "title"
+	}
+	if err := validateRuleField(field); err != nil {
+		return nil, err
+	}
+	match := strings.ToLower(strings.TrimSpace(r.Match))
+	if match == "" {
+		match = "contains"
+	}
+	if err := validateRuleMatch(match); err != nil {
+		return nil, err
+	}
+	var compiled *regexp.Regexp
+	if match == "regex" {
+		var err error
+		compiled, err = compileRuleRegex(r.Pattern)
+		if err != nil {
+			return nil, err
+		}
+	}
 	var exists int
 	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM tags WHERE id = ?`, r.TagID).Scan(&exists); err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("tag %q not found", r.TagID)
+			return nil, fmt.Errorf("%w: tag %q", ErrNotFound, r.TagID)
 		}
 		return nil, err
 	}
 	if r.ID == "" {
-		r.ID = "rule_" + uuid.NewString()[:8]
+		r.ID = newRuleID()
 	}
-	if r.Field == "" {
-		r.Field = "title"
-	}
-	if r.Match == "" {
-		r.Match = "contains"
-	}
+	r.Field = field
+	r.Match = match
+	r.regex = compiled
 	enabled := 0
 	if r.Enabled {
 		enabled = 1
@@ -276,14 +502,11 @@ func (s *Store) ListRules(ctx context.Context) ([]*Rule, error) {
 	defer func() { _ = rows.Close() }()
 	out := make([]*Rule, 0)
 	for rows.Next() {
-		var r Rule
-		var enabled int
-		if err := rows.Scan(&r.ID, &r.TagID, &r.Field, &r.Match, &r.Pattern, &enabled); err != nil {
+		r, err := scanRule(rows)
+		if err != nil {
 			return nil, err
 		}
-		r.Enabled = enabled != 0
-		cp := r
-		out = append(out, &cp)
+		out = append(out, r)
 	}
 	return out, rows.Err()
 }
@@ -298,7 +521,7 @@ func (s *Store) DeleteRule(ctx context.Context, id string) error {
 		return err
 	}
 	if n == 0 {
-		return fmt.Errorf("rule %q not found", id)
+		return fmt.Errorf("%w: rule %q", ErrNotFound, id)
 	}
 	return nil
 }
@@ -316,6 +539,11 @@ func (s *Store) Classify(ctx context.Context, in ClassifyInput) (tags []*Tag, ma
 	if strings.TrimSpace(in.MediaID) == "" {
 		return nil, nil, fmt.Errorf("media_id required")
 	}
+	resolved, err := s.ResolveMediaID(ctx, in.MediaID)
+	if err != nil {
+		return nil, nil, err
+	}
+	in.MediaID = resolved
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -390,16 +618,35 @@ func listRulesTx(ctx context.Context, tx *sql.Tx) ([]*Rule, error) {
 	defer func() { _ = rows.Close() }()
 	out := make([]*Rule, 0)
 	for rows.Next() {
-		var r Rule
-		var enabled int
-		if err := rows.Scan(&r.ID, &r.TagID, &r.Field, &r.Match, &r.Pattern, &enabled); err != nil {
+		r, err := scanRule(rows)
+		if err != nil {
 			return nil, err
 		}
-		r.Enabled = enabled != 0
-		cp := r
-		out = append(out, &cp)
+		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanRule(rows rowScanner) (*Rule, error) {
+	var r Rule
+	var enabled int
+	if err := rows.Scan(&r.ID, &r.TagID, &r.Field, &r.Match, &r.Pattern, &enabled); err != nil {
+		return nil, err
+	}
+	r.Enabled = enabled != 0
+	if strings.EqualFold(r.Match, "regex") {
+		re, err := compileRuleRegex(r.Pattern)
+		if err != nil {
+			return nil, err
+		}
+		r.regex = re
+	}
+	cp := r
+	return &cp, nil
 }
 
 func (s *Store) getTag(ctx context.Context, id string) (*Tag, error) {
@@ -424,7 +671,7 @@ func ruleMatches(r *Rule, in ClassifyInput) bool {
 		haystack = in.MediaType
 	case "genre":
 		for _, g := range in.Genres {
-			if fieldMatch(r.Match, g, r.Pattern) {
+			if fieldMatch(r, g) {
 				return true
 			}
 		}
@@ -432,22 +679,21 @@ func ruleMatches(r *Rule, in ClassifyInput) bool {
 	default:
 		haystack = in.Title
 	}
-	return fieldMatch(r.Match, haystack, r.Pattern)
+	return fieldMatch(r, haystack)
 }
 
-func fieldMatch(mode, value, pattern string) bool {
-	switch strings.ToLower(mode) {
+func fieldMatch(r *Rule, value string) bool {
+	switch strings.ToLower(r.Match) {
 	case "equals":
-		return strings.EqualFold(value, pattern)
+		return strings.EqualFold(value, r.Pattern)
 	case "prefix":
-		return strings.HasPrefix(strings.ToLower(value), strings.ToLower(pattern))
+		return strings.HasPrefix(strings.ToLower(value), strings.ToLower(r.Pattern))
 	case "regex":
-		re, err := regexp.Compile("(?i)" + pattern)
-		if err != nil {
+		if r.regex == nil {
 			return false
 		}
-		return re.MatchString(value)
+		return r.regex.MatchString(value)
 	default: // contains
-		return strings.Contains(strings.ToLower(value), strings.ToLower(pattern))
+		return strings.Contains(strings.ToLower(value), strings.ToLower(r.Pattern))
 	}
 }
