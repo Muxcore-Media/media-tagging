@@ -8,8 +8,10 @@ Exposes `muxcore.tagging.v1.TaggingService` with **SQLite persistence** and auto
 
 | Service | Default |
 |---------|---------|
-| gRPC | `:9740` |
-| Health | `:9741` |
+| gRPC | `127.0.0.1:9740` |
+| Health / HTTP API | `127.0.0.1:9741` |
+
+Set `TAGGING_DATA_DIR` to the MVP data volume (e.g. `$DATA/tagging` from `run-host.sh`) so `tagging.db` persists across restarts.
 
 ## Persistence
 
@@ -22,8 +24,8 @@ Exposes `muxcore.tagging.v1.TaggingService` with **SQLite persistence** and auto
 When `TAGGING_EVENTS_ENABLED` is true (default), the module dials core and classifies:
 
 - `media.file.imported`
-- `media.movie.added` / `media.movie.updated`
-- `media.tv.added` / `media.tv.updated`
+- `media.movie.added` / `media.movie.updated` / `media.movie.removed`
+- `media.tv.added` / `media.tv.updated` / `media.tv.removed`
 
 Offline fixtures under `internal/testdata/events/` drive unit tests without a live mesh.
 

@@ -32,6 +32,12 @@ func (m *Module) Settings() []contracts.SettingDef {
 }
 
 func (m *Module) UpdateSetting(key, value string) error {
+	switch key {
+	case "events_enabled":
+		enabled := value == "1" || value == "true" || value == "TRUE"
+		return m.updateEventsEnabled(enabled)
+	}
+
 	m.cfgMu.Lock()
 	defer m.cfgMu.Unlock()
 	switch key {
@@ -42,8 +48,6 @@ func (m *Module) UpdateSetting(key, value string) error {
 		m.defaultCategory = value
 	case "data_dir":
 		return fmt.Errorf("data_dir is set at startup (TAGGING_DATA_DIR); restart to change")
-	case "events_enabled":
-		m.eventsEnabled = value == "1" || value == "true" || value == "TRUE"
 	default:
 		return fmt.Errorf("unknown setting %q", key)
 	}

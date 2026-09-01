@@ -1,7 +1,10 @@
 package internal_test
 
 import (
+	"bytes"
+	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Muxcore-Media/media-tagging/internal"
@@ -146,5 +149,90 @@ func TestDeleteTagCascades(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Fatalf("expected item tags cleared, got %d", len(got))
+	}
+}
+
+func TestCreateTagUniqueNameCategory(t *testing.T) {
+	s, _ := openTempStore(t)
+	if _, err := s.CreateTag(t.Context(), internal.Tag{Name: "Horror", Category: "genre"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateTag(t.Context(), internal.Tag{Name: "horror", Category: "genre"}); err == nil {
+		t.Fatal("expected duplicate tag error")
+	}
+}
+
+func TestUpsertRuleValidation(t *testing.T) {
+	s, _ := openTempStore(t)
+	tag, err := s.CreateTag(t.Context(), internal.Tag{Name: "T"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		rule internal.Rule
+		want string
+	}{
+		{"bad field", internal.Rule{TagID: tag.ID, Field: "rating", Pattern: "x"}, "invalid field"},
+		{"bad match", internal.Rule{TagID: tag.ID, Field: "title", Match: "fuzzy", Pattern: "x"}, "invalid match"},
+		{"bad regex", internal.Rule{TagID: tag.ID, Field: "title", Match: "regex", Pattern: "(?"}, "invalid regex"},
+		{"missing tag", internal.Rule{TagID: "nope", Field: "title", Pattern: "x"}, "not found"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := s.UpsertRule(t.Context(), tc.rule)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err=%v want contains %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestBackupRoundTrip(t *testing.T) {
+	off := false
+	dir := t.TempDir()
+	m := internal.NewModule(internal.Config{
+		DataDir:       dir,
+		GRPCAddr:      "127.0.0.1:0",
+		HTTPAddr:      "127.0.0.1:0",
+		EventsEnabled: &off,
+	})
+	if err := m.Init(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Stop(t.Context()) })
+
+	tagBody := []byte(`{"name":"backup-tag","category":"test"}`)
+	resp, err := http.Post("http://"+m.HTTPListenAddr()+"/api/tags", "application/json", bytes.NewReader(tagBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("create tag %d", resp.StatusCode)
+	}
+
+	snap, err := m.ExportState(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap) == 0 {
+		t.Fatal("empty snapshot")
+	}
+
+	if err := m.ImportState(t.Context(), snap); err != nil {
+		t.Fatal(err)
+	}
+
+	listResp, err := http.Get("http://" + m.HTTPListenAddr() + "/api/tags")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listResp.Body.Close()
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("list tags %d", listResp.StatusCode)
 	}
 }

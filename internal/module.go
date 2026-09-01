@@ -12,11 +12,15 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/Muxcore-Media/core/pkg/contracts"
 	"github.com/Muxcore-Media/core/sdk/go/client"
 	taggingv1 "github.com/Muxcore-Media/media-tagging/proto/gen/muxcore/tagging/v1"
 )
+
+const moduleVersion = "0.2.1"
 
 type Module struct { //nolint:govet // fieldalignment: lifecycle fields grouped for readability
 	id, grpcAddr, httpAddr string
@@ -29,13 +33,22 @@ type Module struct { //nolint:govet // fieldalignment: lifecycle fields grouped 
 	lis                    net.Listener
 	httpSrv                *http.Server
 
-	peerMu sync.RWMutex
-	mc     *client.Client
+	startCtx context.Context //nolint:containedctx // module lifecycle ctx for event subscribe
+
+	peerMu     sync.RWMutex
+	mc         *client.Client
+	testLookup LibraryLookup
+
+	eventMu         sync.Mutex
+	eventLoopCancel context.CancelFunc
+	subMu           sync.Mutex
+	subCancels      []context.CancelFunc
 }
 
 type Config struct { //nolint:govet // fieldalignment: config fields grouped for readability
 	ID, DefaultCategory, DataDir, GRPCAddr, HTTPAddr string
 	EventsEnabled                                    *bool
+	Lookup                                           LibraryLookup
 }
 
 func NewModule(cfg Config) *Module {
@@ -43,10 +56,10 @@ func NewModule(cfg Config) *Module {
 		cfg.ID = "media-tagging"
 	}
 	if cfg.GRPCAddr == "" {
-		cfg.GRPCAddr = ":9740"
+		cfg.GRPCAddr = "127.0.0.1:9740"
 	}
 	if cfg.HTTPAddr == "" {
-		cfg.HTTPAddr = ":9741"
+		cfg.HTTPAddr = "127.0.0.1:9741"
 	}
 	if cfg.DefaultCategory == "" {
 		cfg.DefaultCategory = "general"
@@ -76,16 +89,16 @@ func NewModule(cfg Config) *Module {
 	return &Module{
 		id: cfg.ID, grpcAddr: cfg.GRPCAddr, httpAddr: cfg.HTTPAddr,
 		dataDir: cfg.DataDir, defaultCategory: cfg.DefaultCategory,
-		eventsEnabled: eventsEnabled,
+		eventsEnabled: eventsEnabled, testLookup: cfg.Lookup,
 	}
 }
 
 func (m *Module) Info() contracts.ModuleInfo {
 	return contracts.ModuleInfo{
-		ID: m.id, Name: "Content Tagging", Version: "0.2.0",
+		ID: m.id, Name: "Content Tagging", Version: moduleVersion,
 		Roles:        []string{"media", "tagging"},
 		Description:  "Content tagging and rule-based classification with SQLite persistence",
-		Capabilities: []string{"media.tagging", "tagging", "classification", "settings"},
+		Capabilities: []string{"media.tagging", "tagging", "classification", "settings", "backupable"},
 		HTTPAddr:     m.grpcAddr,
 	}
 }
@@ -108,6 +121,10 @@ func (m *Module) Start(ctx context.Context) error {
 	if m.store == nil {
 		return fmt.Errorf("store not initialized")
 	}
+	m.cfgMu.Lock()
+	m.startCtx = ctx
+	m.cfgMu.Unlock()
+
 	var lc net.ListenConfig
 	lis, err := lc.Listen(ctx, "tcp", m.grpcAddr)
 	if err != nil {
@@ -125,10 +142,8 @@ func (m *Module) Start(ctx context.Context) error {
 		}
 	}()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
+	mux.HandleFunc("GET /health", m.handleHealthHTTP)
+	mux.HandleFunc("GET /healthz", m.handleHealthHTTP)
 	m.registerTaggingHTTPAPI(mux)
 	httpLis, err := lc.Listen(ctx, "tcp", m.httpAddr)
 	if err != nil {
@@ -145,8 +160,19 @@ func (m *Module) Start(ctx context.Context) error {
 			slog.Error("health serve", "error", serveErr)
 		}
 	}()
-	m.startEventSubscribe(ctx)
+	if m.eventsEnabledSnapshot() {
+		m.startEventSubscribe(ctx)
+	}
 	return nil
+}
+
+func (m *Module) handleHealthHTTP(w http.ResponseWriter, r *http.Request) {
+	if err := m.Health(r.Context()); err != nil {
+		http.Error(w, `{"error":"unhealthy"}`, http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
 }
 
 // GRPCListenAddr returns the bound gRPC address after Start.
@@ -156,6 +182,7 @@ func (m *Module) GRPCListenAddr() string { return m.grpcAddr }
 func (m *Module) HTTPListenAddr() string { return m.httpAddr }
 
 func (m *Module) Stop(ctx context.Context) error {
+	m.stopEventSubscribe()
 	if m.grpcSrv != nil {
 		m.grpcSrv.GracefulStop()
 	}
@@ -173,12 +200,19 @@ func (m *Module) Health(ctx context.Context) error {
 	if m.store == nil {
 		return fmt.Errorf("store not open")
 	}
-	return nil
+	return m.store.Ping(ctx)
 }
 
 type tagServer struct {
 	taggingv1.UnimplementedTaggingServiceServer
 	m *Module
+}
+
+func grpcStatus(err error) error {
+	if isNotFound(err) {
+		return status.Error(codes.NotFound, err.Error())
+	}
+	return err
 }
 
 func (s *tagServer) CreateTag(ctx context.Context, req *taggingv1.CreateTagRequest) (*taggingv1.CreateTagResponse, error) {
@@ -209,7 +243,7 @@ func (s *tagServer) ListTags(ctx context.Context, req *taggingv1.ListTagsRequest
 
 func (s *tagServer) DeleteTag(ctx context.Context, req *taggingv1.DeleteTagRequest) (*taggingv1.DeleteTagResponse, error) {
 	if err := s.m.store.DeleteTag(ctx, req.GetId()); err != nil {
-		return nil, err
+		return nil, grpcStatus(err)
 	}
 	return &taggingv1.DeleteTagResponse{Success: true}, nil
 }
@@ -217,7 +251,7 @@ func (s *tagServer) DeleteTag(ctx context.Context, req *taggingv1.DeleteTagReque
 func (s *tagServer) SetItemTags(ctx context.Context, req *taggingv1.SetItemTagsRequest) (*taggingv1.SetItemTagsResponse, error) {
 	ids, err := s.m.store.SetItemTags(ctx, req.GetMediaId(), req.GetTagIds())
 	if err != nil {
-		return nil, err
+		return nil, grpcStatus(err)
 	}
 	return &taggingv1.SetItemTagsResponse{TagIds: ids}, nil
 }
@@ -240,7 +274,7 @@ func (s *tagServer) UpsertRule(ctx context.Context, req *taggingv1.UpsertRuleReq
 		Match: req.GetMatch(), Pattern: req.GetPattern(), Enabled: req.GetEnabled(),
 	})
 	if err != nil {
-		return nil, err
+		return nil, grpcStatus(err)
 	}
 	return &taggingv1.UpsertRuleResponse{Rule: toPBRule(r)}, nil
 }
@@ -259,7 +293,7 @@ func (s *tagServer) ListRules(ctx context.Context, _ *taggingv1.ListRulesRequest
 
 func (s *tagServer) DeleteRule(ctx context.Context, req *taggingv1.DeleteRuleRequest) (*taggingv1.DeleteRuleResponse, error) {
 	if err := s.m.store.DeleteRule(ctx, req.GetId()); err != nil {
-		return nil, err
+		return nil, grpcStatus(err)
 	}
 	return &taggingv1.DeleteRuleResponse{Success: true}, nil
 }
