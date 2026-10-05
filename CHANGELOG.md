@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.1] - 2026-10-05
+
+### Changed
+- CI runs on GitHub-hosted runners from the umbrella template; retired-origin workflows removed.
+- Dependencies resolve from published GitHub tags (no filesystem `replace`); requires core v0.6.0.
+
 ## [v0.2.1] — 2026-08-31
 
 ### Added
@@ -17,7 +23,7 @@
 - Default bind addresses: `127.0.0.1:9740` / `127.0.0.1:9741`
 - Events import `github.com/Muxcore-Media/contracts-media/events` directly
 - Tag/rule ids use full UUIDs
-- Forgejo CI clones sibling modules, runs golangci-lint + race tests
+- CI clones sibling modules, runs golangci-lint + race tests
 
 ## [v0.2.0] — 2026-08-10
 
