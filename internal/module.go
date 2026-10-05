@@ -17,10 +17,10 @@ import (
 
 	"github.com/Muxcore-Media/core/pkg/contracts"
 	"github.com/Muxcore-Media/core/sdk/go/client"
+	modulesdk "github.com/Muxcore-Media/core/sdk/go/module"
+	manifest "github.com/Muxcore-Media/media-tagging"
 	taggingv1 "github.com/Muxcore-Media/media-tagging/proto/gen/muxcore/tagging/v1"
 )
-
-const moduleVersion = "0.2.1"
 
 type Module struct { //nolint:govet // fieldalignment: lifecycle fields grouped for readability
 	id, grpcAddr, httpAddr string
@@ -95,7 +95,7 @@ func NewModule(cfg Config) *Module {
 
 func (m *Module) Info() contracts.ModuleInfo {
 	return contracts.ModuleInfo{
-		ID: m.id, Name: "Content Tagging", Version: moduleVersion,
+		ID: m.id, Name: "Content Tagging", Version: modulesdk.ManifestVersion(manifest.ManifestJSON),
 		Roles:        []string{"media", "tagging"},
 		Description:  "Content tagging and rule-based classification with SQLite persistence",
 		Capabilities: []string{"media.tagging", "tagging", "classification", "settings", "backupable"},
