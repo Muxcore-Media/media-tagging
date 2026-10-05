@@ -1,7 +1,7 @@
 {
   "id": "media-tagging",
   "name": "Content Tagging",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Content tagging and rule-based classification with SQLite persistence",
   "roles": [
     "media",

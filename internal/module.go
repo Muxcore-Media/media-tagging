@@ -18,6 +18,7 @@ import (
 	"github.com/Muxcore-Media/core/pkg/contracts"
 	"github.com/Muxcore-Media/core/sdk/go/client"
 	modulesdk "github.com/Muxcore-Media/core/sdk/go/module"
+	"github.com/Muxcore-Media/core/sdk/go/module/meshtls"
 	manifest "github.com/Muxcore-Media/media-tagging"
 	taggingv1 "github.com/Muxcore-Media/media-tagging/proto/gen/muxcore/tagging/v1"
 )
@@ -132,7 +133,11 @@ func (m *Module) Start(ctx context.Context) error {
 	}
 	m.lis = lis
 	m.grpcAddr = lis.Addr().String()
-	m.grpcSrv = grpc.NewServer()
+	srvOpt, err := meshtls.ServerOption()
+	if err != nil {
+		return fmt.Errorf("grpc mesh TLS: %w", err)
+	}
+	m.grpcSrv = grpc.NewServer(srvOpt)
 	taggingv1.RegisterTaggingServiceServer(m.grpcSrv, &tagServer{m: m})
 	registerTaggingMesh(m.grpcSrv, m.id, m)
 	go func() {

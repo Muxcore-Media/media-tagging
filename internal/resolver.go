@@ -6,12 +6,12 @@ import (
 	"sync"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	mgmntv1 "github.com/Muxcore-Media/media-movies/proto/mgmntv1"
 	tvmgmtv1 "github.com/Muxcore-Media/media-tvshows/proto/tvmgmtv1"
 
 	"github.com/Muxcore-Media/core/sdk/go/client"
+	"github.com/Muxcore-Media/core/sdk/go/module/meshtls"
 )
 
 // LibraryLookup resolves library ids and genres from media-movies / media-tvshows.
@@ -104,7 +104,7 @@ func (m *meshLookup) dialMovies(ctx context.Context) (mgmntv1.MovieManagementSer
 	if err != nil || len(info) == 0 {
 		return nil, fmt.Errorf("movies module: %w", err)
 	}
-	conn, err := grpc.NewClient(info[0].GetHttpAddr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := meshtls.Dial(info[0].GetHttpAddr())
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +123,7 @@ func (m *meshLookup) dialTV(ctx context.Context) (tvmgmtv1.TvManagementServiceCl
 	if err != nil || len(info) == 0 {
 		return nil, fmt.Errorf("tv module: %w", err)
 	}
-	conn, err := grpc.NewClient(info[0].GetHttpAddr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := meshtls.Dial(info[0].GetHttpAddr())
 	if err != nil {
 		return nil, err
 	}
